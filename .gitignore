@@ -1,0 +1,7 @@
+node_modules
+.env
+.auth
+.venv
+__pycache__
+debug
+chrome-meet-profile
