@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 from orbit.core import log
 from orbit.meet_types import ChatMessage, MeetingState
 from orbit.memory import MemoryAnswer, MemorySearchResult, MemorySource
+from orbit.transcript import TranscriptSegment, format_timestamp_ms
 
 
 EMBEDDING_DIMENSIONS = 1536
@@ -29,6 +30,15 @@ def format_source(source):
         parts.append(f"Meet {source.meeting_code}")
     if source.author:
         parts.append(source.author)
+    elif source.speaker_label:
+        parts.append(source.speaker_label)
+    elif source.start_ms is not None:
+        start_text = format_timestamp_ms(source.start_ms)
+        end_text = format_timestamp_ms(source.end_ms)
+        if start_text and end_text:
+            parts.append(f"{start_text}-{end_text}")
+        elif start_text:
+            parts.append(start_text)
     if source.timestamp_text:
         parts.append(source.timestamp_text)
     return " / ".join(parts) or source.label
@@ -94,6 +104,29 @@ class PostgresMemoryService:
                     """
                 )
                 await cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS orbit_transcript_segments (
+                        id BIGSERIAL PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES orbit_meet_sessions(session_id) ON DELETE CASCADE,
+                        meeting_code TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        source_type TEXT NOT NULL,
+                        speaker_label TEXT,
+                        speaker_confidence TEXT NOT NULL,
+                        detected_language TEXT,
+                        start_ms INTEGER,
+                        end_ms INTEGER,
+                        raw_text TEXT NOT NULL,
+                        clean_text TEXT NOT NULL,
+                        memory_text TEXT NOT NULL,
+                        confidence REAL,
+                        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (session_id, source_id)
+                    )
+                    """
+                )
+                await cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS orbit_memory_chunks (
                         id BIGSERIAL PRIMARY KEY,
@@ -151,6 +184,116 @@ class PostgresMemoryService:
                     ),
                 )
                 await conn.commit()
+
+    async def record_transcript_segments(
+        self,
+        state: MeetingState,
+        segments: list[TranscriptSegment],
+    ) -> None:
+        if not segments:
+            return
+
+        await self.ensure_ready()
+        async with await self._connect() as conn:
+            async with conn.cursor() as cur:
+                await self._upsert_session(cur, state)
+
+                for segment in segments:
+                    metadata = dict(segment.metadata)
+                    metadata["speaker_confidence"] = segment.speaker_confidence
+                    metadata["detected_language"] = segment.detected_language
+                    embedding = await self._embed(segment.memory_text)
+
+                    await cur.execute(
+                        """
+                        INSERT INTO orbit_transcript_segments (
+                            session_id,
+                            meeting_code,
+                            source_id,
+                            source_type,
+                            speaker_label,
+                            speaker_confidence,
+                            detected_language,
+                            start_ms,
+                            end_ms,
+                            raw_text,
+                            clean_text,
+                            memory_text,
+                            confidence,
+                            metadata
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                        ON CONFLICT (session_id, source_id) DO UPDATE SET
+                            speaker_label = EXCLUDED.speaker_label,
+                            speaker_confidence = EXCLUDED.speaker_confidence,
+                            detected_language = EXCLUDED.detected_language,
+                            start_ms = EXCLUDED.start_ms,
+                            end_ms = EXCLUDED.end_ms,
+                            raw_text = EXCLUDED.raw_text,
+                            clean_text = EXCLUDED.clean_text,
+                            memory_text = EXCLUDED.memory_text,
+                            confidence = EXCLUDED.confidence,
+                            metadata = EXCLUDED.metadata
+                        """,
+                        (
+                            state.session_id,
+                            state.meeting_code,
+                            segment.source_id,
+                            segment.source_type,
+                            segment.speaker_label,
+                            segment.speaker_confidence,
+                            segment.detected_language,
+                            segment.start_ms,
+                            segment.end_ms,
+                            segment.raw_text,
+                            segment.clean_text,
+                            segment.memory_text,
+                            segment.confidence,
+                            json.dumps(metadata),
+                        ),
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO orbit_memory_chunks (
+                            source_type,
+                            source_id,
+                            meeting_code,
+                            session_id,
+                            text,
+                            metadata,
+                            embedding
+                        )
+                        VALUES ('meet_transcript', %s, %s, %s, %s, %s::jsonb, %s::vector)
+                        ON CONFLICT (source_type, source_id) DO UPDATE SET
+                            text = EXCLUDED.text,
+                            metadata = EXCLUDED.metadata,
+                            embedding = EXCLUDED.embedding
+                        """,
+                        (
+                            f"{state.session_id}:{segment.source_id}",
+                            state.meeting_code,
+                            state.session_id,
+                            segment.memory_text,
+                            json.dumps(
+                                {
+                                    "speaker_label": segment.speaker_label,
+                                    "speaker_confidence": segment.speaker_confidence,
+                                    "detected_language": segment.detected_language,
+                                    "start_ms": segment.start_ms,
+                                    "end_ms": segment.end_ms,
+                                    "raw_text": segment.raw_text,
+                                    "clean_text": segment.clean_text,
+                                }
+                            ),
+                            vector_literal(embedding),
+                        ),
+                    )
+
+                await conn.commit()
+                log(
+                    f"Indexed {len(segments)} transcript segment(s) for Meet {state.meeting_code}.",
+                    state.session_id,
+                )
 
     async def finalize_meeting(self, state: MeetingState) -> None:
         await self.ensure_ready()
@@ -247,12 +390,18 @@ class PostgresMemoryService:
                                 meeting_code=row["meeting_code"],
                                 author=metadata.get("author"),
                                 timestamp_text=metadata.get("timestamp_text"),
+                                speaker_label=metadata.get("speaker_label"),
+                                start_ms=metadata.get("start_ms"),
+                                end_ms=metadata.get("end_ms"),
                             )
                         ),
                         source_type=row["source_type"],
                         meeting_code=row["meeting_code"],
                         author=metadata.get("author"),
                         timestamp_text=metadata.get("timestamp_text"),
+                        speaker_label=metadata.get("speaker_label"),
+                        start_ms=metadata.get("start_ms"),
+                        end_ms=metadata.get("end_ms"),
                     ),
                 )
             )

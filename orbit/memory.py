@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 from orbit.core import env_int, log
 from orbit.meet_types import ChatMessage, MeetingState
+from orbit.transcript import TranscriptSegment
 
 
 @dataclass
@@ -17,6 +18,9 @@ class MemorySource:
     meeting_code: str | None = None
     author: str | None = None
     timestamp_text: str | None = None
+    speaker_label: str | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
 
 
 @dataclass
@@ -36,6 +40,13 @@ class MemoryService(Protocol):
     async def record_meeting_chat(self, state: MeetingState, message: ChatMessage) -> None:
         ...
 
+    async def record_transcript_segments(
+        self,
+        state: MeetingState,
+        segments: list[TranscriptSegment],
+    ) -> None:
+        ...
+
     async def finalize_meeting(self, state: MeetingState) -> None:
         ...
 
@@ -48,6 +59,13 @@ class MemoryService(Protocol):
 
 class DisabledMemoryService:
     async def record_meeting_chat(self, state: MeetingState, message: ChatMessage) -> None:
+        return None
+
+    async def record_transcript_segments(
+        self,
+        state: MeetingState,
+        segments: list[TranscriptSegment],
+    ) -> None:
         return None
 
     async def finalize_meeting(self, state: MeetingState) -> None:

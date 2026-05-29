@@ -11,6 +11,7 @@ from orbit.whatsapp_service import OrbitWhatsAppService
 class FakeMemory:
     def __init__(self, answer=None):
         self.recorded = []
+        self.transcripts = []
         self.finalized = []
         self.questions = []
         self.answer = answer or MemoryAnswer(
@@ -28,6 +29,9 @@ class FakeMemory:
 
     async def record_meeting_chat(self, state, message):
         self.recorded.append((state, message))
+
+    async def record_transcript_segments(self, state, segments):
+        self.transcripts.append((state, segments))
 
     async def finalize_meeting(self, state):
         self.finalized.append(state)

@@ -2,7 +2,7 @@
 
 **Orbit is an AI layer for company knowledge.**
 
-It joins Google Meets, watches meeting chat, stores organizational memory, and makes that memory queryable through AI agents. The current product surface is a WhatsApp agent backed by FastAPI, browser automation, OpenAI, and an optional Postgres + pgvector memory layer.
+It joins Google Meets, watches meeting chat, can ingest meeting transcripts, stores organizational memory, and makes that memory queryable through AI agents. The current product surface is a WhatsApp agent backed by FastAPI, browser automation, OpenAI, Groq Whisper-compatible transcription, and an optional Postgres + pgvector memory layer.
 
 Think of Orbit as an early version of a **queryable company operating system**: agents that can attend workflows, remember what happened, and answer questions from the company context they have actually seen.
 
@@ -14,6 +14,8 @@ Think of Orbit as an early version of a **queryable company operating system**: 
 - Sends a short intro message after joining a meeting.
 - Opens and monitors Google Meet chat.
 - Captures visible Meet chat messages during the session.
+- Imports multilingual transcript segments from saved audio or video files through Groq transcription.
+- Normalizes transcript segments before writing them into persistent memory.
 - Detects `@orbit` mentions inside Meet chat.
 - Starts meetings from WhatsApp via Twilio.
 - Sends WhatsApp status updates while meetings are running.
@@ -57,15 +59,19 @@ The important design choice is that memory is behind `orbit/memory.py`. The curr
 scripts/
   join_meet.py          Direct Google Meet runner
   whatsapp_bot.py       WhatsApp/FastAPI entrypoint
+  transcribe_media.py   Transcript import from local audio/video
 
 orbit/
   core.py               Env loading, logging, runtime helpers
+  groq_transcriber.py   Groq Whisper-compatible transcription client
   meet.py               Google Meet browser automation + chat monitoring
   meet_types.py         Meeting/session/chat dataclasses
   whatsapp_app.py       FastAPI app and Twilio webhook route
   whatsapp_service.py   WhatsApp orchestration and agent behavior
   memory.py             Swappable memory service interface
   postgres_memory.py    Postgres + pgvector memory implementation
+  transcript.py         Transcript dataclasses
+  transcript_normalizer.py
 
 tests/
   test_whatsapp_memory.py
@@ -99,7 +105,18 @@ Use `@orbit` or `orbit:` on WhatsApp to ask about currently active Meet chat con
 
 This path only uses live captured Meet chat.
 
-### 4. Ask company-memory questions
+### 4. Import a meeting recording
+
+Transcribe a local audio or video file with Groq and ingest the normalized transcript into Orbit memory:
+
+```bash
+source .venv-browser-use/bin/activate
+python scripts/transcribe_media.py ./recordings/demo-meeting.m4a --meet-url https://meet.google.com/abc-defg-hij
+```
+
+This writes a debug transcript JSON file under `debug/transcripts/` and, when `DATABASE_URL` is configured, indexes transcript segments into the same memory layer used by WhatsApp Q&A.
+
+### 5. Ask company-memory questions
 
 Send a normal WhatsApp question without `@orbit`:
 
@@ -240,6 +257,8 @@ Answers from persistent company memory.
 | `OPENAI_API_KEY` | OpenAI API key for chat and embeddings |
 | `OPENAI_MODEL` | Chat model used by Orbit |
 | `OPENAI_EMBEDDING_MODEL` | Embedding model for memory search |
+| `GROQ_API_KEY` | Groq API key for transcript import |
+| `GROQ_TRANSCRIPTION_MODEL` | Groq speech-to-text model, default `whisper-large-v3-turbo` |
 | `DATABASE_URL` | Enables Postgres + pgvector memory |
 | `TWILIO_ACCOUNT_SID` | Twilio account SID |
 | `TWILIO_AUTH_TOKEN` | Twilio auth token |
@@ -272,13 +291,17 @@ Compile-check the core modules:
   orbit/memory.py \
   orbit/postgres_memory.py \
   orbit/whatsapp_app.py \
-  orbit/whatsapp_service.py
+  orbit/whatsapp_service.py \
+  orbit/groq_transcriber.py \
+  orbit/transcript.py \
+  orbit/transcript_normalizer.py
 ```
 
 ## Current Limits
 
-- Orbit reads Google Meet chat only. It does not process meeting audio.
-- Persistent memory currently indexes captured Meet chat only.
+- Orbit reads Google Meet chat live. Audio transcription currently happens through offline media import, not live system-audio capture.
+- Speaker attribution for imported transcripts is best effort only unless a separate caption or participant signal is available.
+- Persistent memory indexes both captured Meet chat and imported transcript segments.
 - Slack, email, document ingestion, dashboards, multi-company tenancy, and auth are future layers.
 - Google Meet UI changes may require selector updates.
 - Orbit does not bypass Google Meet, WhatsApp, or company access controls.
