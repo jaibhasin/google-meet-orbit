@@ -1,5 +1,6 @@
 let audioContext = null;
 let mediaStream = null;
+let source = null;
 let processor = null;
 let socket = null;
 
@@ -18,48 +19,65 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 async function startCapture(config) {
   await stopCapture();
 
-  const audioFormat = config.audioFormat || {};
-  const sampleRate = Number(audioFormat.sampleRate || 16000);
-  const channels = Number(audioFormat.channels || 1);
+  try {
+    const audioFormat = config.audioFormat || {};
+    const sampleRate = Number(audioFormat.sampleRate || 16000);
+    const channels = Number(audioFormat.channels || 1);
 
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      mandatory: {
-        chromeMediaSource: "tab",
-        chromeMediaSourceId: config.streamId
-      }
-    },
-    video: false
-  });
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: "tab",
+          chromeMediaSourceId: config.streamId
+        }
+      },
+      video: false
+    });
 
-  audioContext = new AudioContext({ sampleRate });
-  const actualSampleRate = audioContext.sampleRate;
+    audioContext = new AudioContext({ sampleRate });
+    await audioContext.resume();
+    const actualSampleRate = audioContext.sampleRate;
 
-  socket = new WebSocket(config.webSocketUrl);
-  socket.binaryType = "arraybuffer";
-  await waitForSocketOpen(socket);
-  socket.send(JSON.stringify({
-    type: "start",
-    encoding: "linear16",
-    sample_rate: actualSampleRate,
-    channels,
-    session_id: config.sessionId,
-    meeting_id: config.meetingId
-  }));
+    socket = new WebSocket(config.webSocketUrl);
+    socket.binaryType = "arraybuffer";
+    await waitForSocketOpen(socket);
+    const activeSocket = socket;
+    activeSocket.addEventListener("close", () => {
+      if (socket !== activeSocket) return;
+      socket = null;
+      void stopCapture();
+    });
+    activeSocket.send(JSON.stringify({
+      type: "start",
+      encoding: "linear16",
+      sample_rate: actualSampleRate,
+      channels,
+      session_id: config.sessionId,
+      meeting_id: config.meetingId
+    }));
 
-  const source = audioContext.createMediaStreamSource(mediaStream);
-  processor = audioContext.createScriptProcessor(4096, 1, 1);
-  processor.onaudioprocess = (event) => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const pcm16 = convertToMonoPcm16(event.inputBuffer);
-    if (pcm16.byteLength > 0) socket.send(pcm16.buffer);
-  };
+    source = audioContext.createMediaStreamSource(mediaStream);
+    processor = audioContext.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (event) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const pcm16 = convertToMonoPcm16(event.inputBuffer);
+      if (pcm16.byteLength > 0) socket.send(pcm16.buffer);
+    };
 
-  source.connect(processor);
-  processor.connect(audioContext.destination);
+    source.connect(audioContext.destination);
+    source.connect(processor);
+    processor.connect(audioContext.destination);
+  } catch (error) {
+    await stopCapture();
+    throw error;
+  }
 }
 
 async function stopCapture() {
+  if (source) {
+    source.disconnect();
+    source = null;
+  }
   if (processor) {
     processor.disconnect();
     processor = null;
@@ -72,17 +90,21 @@ async function stopCapture() {
     for (const track of mediaStream.getTracks()) track.stop();
     mediaStream = null;
   }
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "stop" }));
-    socket.close();
-  }
+  const activeSocket = socket;
   socket = null;
+  if (activeSocket && activeSocket.readyState !== WebSocket.CLOSED) {
+    if (activeSocket.readyState === WebSocket.OPEN) {
+      activeSocket.send(JSON.stringify({ type: "stop" }));
+    }
+    activeSocket.close();
+  }
 }
 
 function waitForSocketOpen(targetSocket) {
   return new Promise((resolve, reject) => {
     targetSocket.onopen = resolve;
     targetSocket.onerror = () => reject(new Error("Orbit audio WebSocket failed to open."));
+    targetSocket.onclose = () => reject(new Error("Orbit audio WebSocket closed before opening."));
   });
 }
 

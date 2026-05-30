@@ -116,6 +116,7 @@ class DeepgramLiveTranscriber:
         self.config = config or DeepgramLiveConfig()
         self._connect = connect
         self._ws = None
+        self._finish_sent = False
 
     async def connect(self):
         if self._ws is not None:
@@ -152,15 +153,24 @@ class DeepgramLiveTranscriber:
         async for message in self._ws:
             yield message
 
+    async def finish(self) -> None:
+        if self._ws is None:
+            return
+        if self._finish_sent:
+            return
+        await self._ws.send(json.dumps({"type": "CloseStream"}))
+        self._finish_sent = True
+
     async def close(self) -> None:
         if self._ws is None:
             return
         try:
-            await self._ws.send(json.dumps({"type": "CloseStream"}))
+            await self.finish()
         except Exception:
             pass
         await self._ws.close()
         self._ws = None
+        self._finish_sent = False
 
 
 def _first_numeric(*values) -> float | None:

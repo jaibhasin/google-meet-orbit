@@ -54,6 +54,7 @@ class LiveSTTSession:
         self.final_segments_recorded = 0
         self.last_error: str | None = None
         self.closed = False
+        self._finalize_timeout_s = 1.5
 
     async def start(self) -> None:
         if self.transcriber is not None:
@@ -102,6 +103,14 @@ class LiveSTTSession:
     async def close(self) -> None:
         self.closed = True
         if self.transcriber is not None:
+            finish = getattr(self.transcriber, "finish", None)
+            if finish is not None:
+                await finish()
+                if self.receive_task is not None:
+                    try:
+                        await asyncio.wait_for(self.receive_task, timeout=self._finalize_timeout_s)
+                    except asyncio.TimeoutError:
+                        pass
             await self.transcriber.close()
         if self.receive_task is not None:
             self.receive_task.cancel()
@@ -148,6 +157,7 @@ class LiveSTTManager:
         self.model = model
         self.transcriber_factory = transcriber_factory
         self.sessions: dict[str, LiveSTTSession] = {}
+        self.pending_captions: dict[str, list[CaptionSnippet]] = {}
         self.lock = asyncio.Lock()
 
     @property
@@ -173,17 +183,24 @@ class LiveSTTManager:
                     audio_format=audio_format,
                     transcriber_factory=self.transcriber_factory,
                 )
+                pending_captions = self.pending_captions.pop(state.session_id, [])
+                session.add_captions(pending_captions)
                 self.sessions[state.session_id] = session
             return session
 
     async def add_captions(self, state: MeetingState, captions: list[CaptionSnippet]) -> None:
         async with self.lock:
             session = self.sessions.get(state.session_id)
-        if session is not None:
-            session.add_captions(captions)
+            if session is not None:
+                session.add_captions(captions)
+                return
+            buffered = self.pending_captions.setdefault(state.session_id, [])
+            buffered.extend(captions)
+            self.pending_captions[state.session_id] = buffered[-100:]
 
     async def stop(self, session_id: str) -> None:
         async with self.lock:
             session = self.sessions.pop(session_id, None)
+            self.pending_captions.pop(session_id, None)
         if session is not None:
             await session.close()

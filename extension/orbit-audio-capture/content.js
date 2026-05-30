@@ -48,8 +48,11 @@ function injectStartButton() {
         button.disabled = true;
         button.style.opacity = "0.72";
       } else {
-        button.textContent = "Start Orbit audio";
-        console.warn("Orbit audio capture did not start:", response && response.error);
+        button.textContent = "Use Alt+Shift+O or the extension icon";
+        console.warn(
+          "Orbit audio capture did not start. Use the extension shortcut or icon:",
+          chrome.runtime.lastError?.message || (response && response.error)
+        );
       }
     });
   });

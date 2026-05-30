@@ -156,6 +156,22 @@ class LiveSTTTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await manager.get_or_create(build_state(), LiveAudioFormat())
 
+    async def test_manager_buffers_captions_before_audio_session_exists(self):
+        memory = FakeMemory()
+        manager = LiveSTTManager(memory=memory, api_key="dg-key")
+        state = build_state()
+
+        await manager.add_captions(
+            state,
+            [CaptionSnippet(speaker_name="Priya", text="we should launch on friday")],
+        )
+        session = await manager.get_or_create(state, LiveAudioFormat())
+
+        await session.process_deepgram_message(final_deepgram_message())
+
+        segment = memory.transcripts[0][1][0]
+        self.assertEqual(segment.speaker_name, "Priya")
+
 
 if __name__ == "__main__":
     unittest.main()

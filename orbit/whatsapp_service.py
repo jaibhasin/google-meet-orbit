@@ -216,6 +216,7 @@ class OrbitWhatsAppService:
             model_name=default_config.model_name,
             live_stt_enabled=default_config.live_stt_enabled,
             audio_stream_ws_url=default_config.audio_stream_ws_url,
+            audio_stream_token=default_config.audio_stream_token,
         )
 
     async def handle_session_status(self, state, status, detail):
@@ -239,7 +240,8 @@ class OrbitWhatsAppService:
 
         if status == "live_stt_capture_requested":
             await self.send_whatsapp_message(
-                f"Orbit requested live audio transcription for Meet {state.meeting_code}."
+                f"Orbit requested live audio transcription for Meet {state.meeting_code}. "
+                "Waiting for the first audio chunk."
             )
             return
 
@@ -506,6 +508,10 @@ class OrbitWhatsAppService:
         if active is None:
             await websocket.close(code=4404, reason="Unknown Orbit meeting session.")
             return
+        expected_token = active.state.live_stt_audio_token
+        if expected_token and websocket.query_params.get("token") != expected_token:
+            await websocket.close(code=4403, reason="Invalid Orbit audio stream token.")
+            return
         if not self.live_stt.available:
             await websocket.close(code=4401, reason="Missing DEEPGRAM_API_KEY.")
             return
@@ -516,10 +522,21 @@ class OrbitWhatsAppService:
             while True:
                 message = await websocket.receive()
                 if message.get("bytes") is not None:
+                    if not message["bytes"]:
+                        continue
                     if session is None:
                         session = await self.live_stt.get_or_create(active.state)
-                        active.state.live_stt_started = True
                     await session.send_audio(message["bytes"])
+                    if not active.state.live_stt_started:
+                        active.state.live_stt_started = True
+                        active.state.live_stt_audio_confirmed_at = now_iso()
+                        active.state.live_stt_status_detail = (
+                            "Deepgram stream connected and first audio chunk forwarded."
+                        )
+                        await self.send_whatsapp_message(
+                            f"Orbit confirmed live audio transcription for Meet "
+                            f"{active.state.meeting_code}."
+                        )
                     continue
 
                 raw_text = message.get("text")
@@ -531,8 +548,9 @@ class OrbitWhatsAppService:
                 if message_type in {"start", "config"}:
                     audio_format = LiveAudioFormat.from_payload(payload)
                     session = await self.live_stt.get_or_create(active.state, audio_format)
-                    active.state.live_stt_started = True
-                    active.state.live_stt_status_detail = "Extension audio WebSocket connected."
+                    active.state.live_stt_status_detail = (
+                        "Extension audio WebSocket connected. Waiting for the first audio chunk."
+                    )
                     await websocket.send_json({"type": "ready"})
                 elif message_type == "stop":
                     break

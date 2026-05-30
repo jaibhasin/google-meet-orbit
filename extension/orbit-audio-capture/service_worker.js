@@ -1,5 +1,6 @@
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const captureConfigsByTab = new Map();
+let creatingOffscreenDocument = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return false;
@@ -97,11 +98,16 @@ async function getCaptureConfig(tabId) {
 async function ensureOffscreenDocument() {
   if (await hasOffscreenDocument()) return;
 
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_DOCUMENT_PATH,
-    reasons: ["USER_MEDIA"],
-    justification: "Capture Google Meet tab audio and stream it to the local Orbit backend."
-  });
+  if (!creatingOffscreenDocument) {
+    creatingOffscreenDocument = chrome.offscreen.createDocument({
+      url: OFFSCREEN_DOCUMENT_PATH,
+      reasons: ["USER_MEDIA"],
+      justification: "Capture Google Meet tab audio and stream it to the local Orbit backend."
+    }).finally(() => {
+      creatingOffscreenDocument = null;
+    });
+  }
+  await creatingOffscreenDocument;
 }
 
 async function hasOffscreenDocument() {

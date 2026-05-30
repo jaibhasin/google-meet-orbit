@@ -106,8 +106,9 @@ class FakeLiveSTTSession:
 
 
 class FakeWebSocket:
-    def __init__(self, messages):
+    def __init__(self, messages, query_params=None):
         self.messages = list(messages)
+        self.query_params = query_params or {}
         self.accepted = False
         self.sent_json = []
         self.closed = None
@@ -246,6 +247,12 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_extension_audio_stream_forwards_chunks_to_live_stt(self):
         service = build_service()
+        whatsapp_updates = []
+
+        async def fake_send_whatsapp_message(body):
+            whatsapp_updates.append(body)
+
+        service.send_whatsapp_message = fake_send_whatsapp_message
         state = MeetingState(
             session_id="session-1",
             meet_url="https://meet.google.com/abc-defg-hij",
@@ -272,6 +279,72 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         fake_session = service.live_stt.sessions[0][2]
         self.assertEqual(fake_session.audio_chunks, [b"pcm"])
         self.assertEqual(service.live_stt.stopped, [state.session_id])
+        self.assertTrue(state.live_stt_started)
+        self.assertIsNotNone(state.live_stt_audio_confirmed_at)
+        self.assertEqual(
+            state.live_stt_status_detail,
+            "Deepgram stream connected and first audio chunk forwarded.",
+        )
+        self.assertEqual(
+            whatsapp_updates,
+            ["Orbit confirmed live audio transcription for Meet abc-defg-hij."],
+        )
+
+    async def test_extension_audio_stream_is_not_confirmed_before_first_chunk(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        service.active_sessions[state.session_id] = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+        )
+        websocket = FakeWebSocket(
+            [
+                {"text": '{"type":"start","encoding":"linear16","sample_rate":16000,"channels":1}'},
+                {"text": '{"type":"stop"}'},
+            ]
+        )
+
+        await service.handle_audio_stream(websocket, state.session_id)
+
+        self.assertFalse(state.live_stt_started)
+        self.assertIsNone(state.live_stt_audio_confirmed_at)
+        self.assertEqual(
+            state.live_stt_status_detail,
+            "Extension audio WebSocket connected. Waiting for the first audio chunk.",
+        )
+
+    async def test_extension_empty_audio_chunk_does_not_confirm_live_stt(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        service.active_sessions[state.session_id] = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+        )
+        websocket = FakeWebSocket(
+            [
+                {"text": '{"type":"start","encoding":"linear16","sample_rate":16000,"channels":1}'},
+                {"bytes": b""},
+                {"text": '{"type":"stop"}'},
+            ]
+        )
+
+        await service.handle_audio_stream(websocket, state.session_id)
+
+        self.assertFalse(state.live_stt_started)
+        fake_session = service.live_stt.sessions[0][2]
+        self.assertEqual(fake_session.audio_chunks, [])
 
     async def test_extension_missing_unknown_session_closes_websocket(self):
         service = build_service()
@@ -280,6 +353,27 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         await service.handle_audio_stream(websocket, "missing")
 
         self.assertEqual(websocket.closed[0], 4404)
+
+    async def test_extension_audio_stream_rejects_bad_session_token(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+            live_stt_audio_token="expected-token",
+        )
+        service.active_sessions[state.session_id] = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+        )
+        websocket = FakeWebSocket([], query_params={"token": "wrong-token"})
+
+        await service.handle_audio_stream(websocket, state.session_id)
+
+        self.assertEqual(websocket.closed[0], 4403)
+        self.assertFalse(websocket.accepted)
 
 
 if __name__ == "__main__":

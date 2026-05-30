@@ -41,6 +41,8 @@ class MeetingState:
     live_stt_requested: bool = False
     live_stt_available: bool = False
     live_stt_started: bool = False
+    live_stt_audio_confirmed_at: str | None = None
+    live_stt_audio_token: str | None = None
     live_stt_status_detail: str | None = None
     seen_message_fingerprints: set[str] = field(default_factory=set)
     captured_messages: list[ChatMessage] = field(default_factory=list)
@@ -60,6 +62,7 @@ class MeetingSessionConfig:
     model_name: str
     live_stt_enabled: bool = False
     audio_stream_ws_url: str | None = None
+    audio_stream_token: str | None = None
 
 
 @dataclass
@@ -77,4 +80,5 @@ def build_meeting_state(config):
         meet_url=config.meet_url,
         meeting_code=extract_meeting_code(config.meet_url),
         display_name=config.display_name,
+        live_stt_audio_token=config.audio_stream_token,
     )

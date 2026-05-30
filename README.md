@@ -2,7 +2,7 @@
 
 **Orbit is a source-backed recall layer for meetings and decisions.**
 
-It joins Google Meets, watches meeting chat, can ingest meeting transcripts, stores organizational memory, and makes that memory queryable through AI agents. The current bootstrap control plane is a WhatsApp agent backed by FastAPI, browser automation, OpenAI, Groq Whisper-compatible transcription, and an optional Postgres + pgvector memory layer.
+It joins Google Meets, watches meeting chat, captures live meeting transcripts, stores organizational memory, and makes that memory queryable through AI agents. The current bootstrap control plane is a WhatsApp agent backed by FastAPI, browser automation, OpenAI, Deepgram live STT, and an optional Postgres + pgvector memory layer.
 
 The product thesis is narrower than "a WhatsApp bot": Orbit is trying to answer what was decided, why, and what source evidence backs that answer. WhatsApp is the fastest shell around that workflow today, not the moat.
 
@@ -14,8 +14,10 @@ The product thesis is narrower than "a WhatsApp bot": Orbit is trying to answer 
 - Sends a short intro message after joining a meeting.
 - Opens and monitors Google Meet chat.
 - Captures visible Meet chat messages during the session.
-- Imports multilingual transcript segments from saved audio or video files through Groq transcription.
-- Normalizes transcript segments before writing them into persistent memory.
+- Captures Google Meet tab audio through a local Manifest V3 Chrome extension.
+- Streams live audio to the Orbit backend, then forwards it to Deepgram for STT.
+- Normalizes final transcript segments before writing them into persistent memory.
+- Uses Google Meet captions as a best-effort speaker attribution layer when available.
 - Detects `@orbit` mentions inside Meet chat.
 - Starts meetings from WhatsApp via Twilio.
 - Sends WhatsApp status updates while meetings are running.
@@ -40,8 +42,15 @@ OrbitWhatsAppService
       |       v
       |   Browser Use + Chrome
       |       |
-      |       v
-      |   Meet chat capture
+      |       +--> Meet chat capture
+      |       |
+      |       +--> Chrome extension tab audio capture
+      |                 |
+      |                 v
+      |           Orbit local audio WebSocket
+      |                 |
+      |                 v
+      |           Deepgram live STT
       |
       +--> MemoryService interface
               |
@@ -60,23 +69,32 @@ The important design choice is that memory is behind `orbit/memory.py`. The curr
 scripts/
   join_meet.py          Direct Google Meet runner
   whatsapp_bot.py       WhatsApp/FastAPI entrypoint
-  transcribe_media.py   Transcript import from local audio/video
+  stream_monitor_audio.py
+                        Fallback/debug PulseAudio/PipeWire monitor streamer
 
 orbit/
   core.py               Env loading, logging, runtime helpers
-  groq_transcriber.py   Groq Whisper-compatible transcription client
+  caption_attribution.py
+                        Best-effort caption speaker attribution
+  deepgram_live.py      Deepgram live STT WebSocket client + event parsing
+  live_stt.py           Live STT session manager
   meet.py               Google Meet browser automation + chat monitoring
   meet_types.py         Meeting/session/chat dataclasses
   whatsapp_app.py       FastAPI app and Twilio webhook route
   whatsapp_service.py   WhatsApp orchestration and agent behavior
   memory.py             Swappable memory service interface
   postgres_memory.py    Postgres + pgvector memory implementation
-  transcript.py         Transcript dataclasses
+  transcript.py         Transcript segment dataclass
   transcript_normalizer.py
+
+extension/orbit-audio-capture/
+  Manifest V3 Chrome extension for Meet tab audio capture
 
 tests/
   test_whatsapp_memory.py
 ```
+
+For the live STT flow, see [docs/live-stt.md](docs/live-stt.md).
 
 ## How It Works
 
@@ -106,16 +124,11 @@ Use `@orbit` or `orbit:` on WhatsApp to ask about currently active Meet chat con
 
 This path only uses live captured Meet chat.
 
-### 4. Import a meeting recording
+### 4. Capture live meeting transcripts
 
-Transcribe a local audio or video file with Groq and ingest the normalized transcript into Orbit memory:
+When live STT is enabled, Orbit posts a capture config into the Meet tab after joining. The local Chrome extension captures the Meet tab audio with `chrome.tabCapture`, streams PCM16 audio to Orbit's local WebSocket, and Orbit forwards the stream to Deepgram.
 
-```bash
-source .venv-browser-use/bin/activate
-python scripts/transcribe_media.py ./recordings/demo-meeting.m4a --meet-url https://meet.google.com/abc-defg-hij
-```
-
-This writes a debug transcript JSON file under `debug/transcripts/` and, when `DATABASE_URL` is configured, indexes transcript segments into the same memory layer used by WhatsApp Q&A.
+Final Deepgram transcript segments are normalized and stored in memory. Speaker names are optional: Meet caption scraping can enrich segments when it works, but audio-only transcripts still store normally.
 
 ### 5. Ask company-memory questions
 
@@ -156,6 +169,12 @@ OPENAI_API_KEY=...
 OPENAI_MODEL=gpt-5.4-mini
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
+DEEPGRAM_API_KEY=...
+DEEPGRAM_LIVE_MODEL=nova-3
+ORBIT_LIVE_STT_ENABLED=true
+ORBIT_AUDIO_WS_BASE_URL=ws://127.0.0.1:8000
+ORBIT_CHROME_EXTENSION_PATH=extension/orbit-audio-capture
+
 TWILIO_ACCOUNT_SID=...
 TWILIO_AUTH_TOKEN=...
 TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
@@ -191,9 +210,10 @@ Orbit creates its v1 tables automatically on first memory use:
 
 - `orbit_meet_sessions`
 - `orbit_chat_messages`
+- `orbit_transcript_segments`
 - `orbit_memory_chunks`
 
-The schema stores meeting/session metadata, raw captured chat messages, and vectorized memory chunks. This schema is deliberately treated as replaceable while the product memory model evolves.
+The schema stores meeting/session metadata, raw captured chat messages, final transcript segments, and vectorized memory chunks. This schema is deliberately treated as replaceable while the product memory model evolves.
 
 ## Run
 
@@ -260,7 +280,7 @@ Fallback/debug live audio stream from a PulseAudio/PipeWire monitor source:
 
 ```bash
 .venv-browser-use/bin/python scripts/stream_monitor_audio.py \
-  ws://127.0.0.1:8000/internal/audio-stream/<session-id> \
+  'ws://127.0.0.1:8000/internal/audio-stream/<session-id>?token=<session-token>' \
   --source default
 ```
 
@@ -278,8 +298,6 @@ Fallback/debug live audio stream from a PulseAudio/PipeWire monitor source:
 | `ORBIT_CHROME_EXTENSION_PATH` | Unpacked MV3 extension path, default `extension/orbit-audio-capture` |
 | `ORBIT_CHROME_CDP_URL` | Existing headed Chrome CDP URL for browser-use to connect to |
 | `ORBIT_EXTENSION_CAPTURE_SHORTCUT` | Shortcut used to activate extension capture, default `Alt+Shift+O` |
-| `GROQ_API_KEY` | Groq API key for transcript import |
-| `GROQ_TRANSCRIPTION_MODEL` | Groq speech-to-text model, default `whisper-large-v3-turbo` |
 | `DATABASE_URL` | Enables Postgres + pgvector memory |
 | `TWILIO_ACCOUNT_SID` | Twilio account SID |
 | `TWILIO_AUTH_TOKEN` | Twilio auth token |
@@ -313,7 +331,9 @@ Compile-check the core modules:
   orbit/postgres_memory.py \
   orbit/whatsapp_app.py \
   orbit/whatsapp_service.py \
-  orbit/groq_transcriber.py \
+  orbit/caption_attribution.py \
+  orbit/deepgram_live.py \
+  orbit/live_stt.py \
   orbit/transcript.py \
   orbit/transcript_normalizer.py
 ```
@@ -322,9 +342,10 @@ Compile-check the core modules:
 
 - Orbit reads Google Meet chat live and can request live audio transcription through the local Chrome extension.
 - The primary live STT path is headed Chrome under a virtual display, browser-use over CDP, extension tab audio capture, and backend-owned Deepgram streaming.
+- With `ORBIT_CHROME_CDP_URL` or `GMEET_USE_SYSTEM_CHROME=true`, load the unpacked extension manually from `chrome://extensions`. Official Chrome 137+ no longer loads unpacked extensions from command-line flags.
 - PulseAudio/PipeWire monitor capture is a fallback/debug path, not the primary architecture.
 - Speaker attribution is best effort. Google Meet caption scraping can enrich speaker names, but selectors are unstable and failures do not block Deepgram transcript storage.
-- Persistent memory indexes both captured Meet chat and imported transcript segments.
+- Persistent memory indexes both captured Meet chat and final live transcript segments.
 - Slack, email, document ingestion, dashboards, multi-company tenancy, and auth are future layers.
 - Google Meet UI changes may require selector updates.
 - Orbit does not bypass Google Meet, WhatsApp, or company access controls.

@@ -5,7 +5,9 @@ import inspect
 import json
 import os
 import re
+import secrets
 from pathlib import Path
+from urllib.parse import urlencode
 
 from orbit.caption_attribution import CaptionSnippet
 from orbit.core import (
@@ -85,10 +87,15 @@ def build_browser(Browser, session_id=None):
                 f"--load-extension={resolved_extension_path}",
             ]
         )
-        log(f"Loading Orbit audio capture extension: {resolved_extension_path}", session_id)
 
     if use_system_chrome:
         log("Using Browser Use with your installed Chrome profile.", session_id)
+        if browser_args:
+            log(
+                "Official Chrome 137+ ignores command-line unpacked-extension loading. "
+                "Load the Orbit extension manually from chrome://extensions before joining.",
+                session_id,
+            )
         if profile_directory:
             log(f"Requested Chrome profile: {profile_directory}", session_id)
             return Browser.from_system_chrome(
@@ -99,6 +106,8 @@ def build_browser(Browser, session_id=None):
         return Browser.from_system_chrome(keep_alive=True, args=browser_args or None)
 
     log("Using Browser Use managed browser session for guest join flow.", session_id)
+    if browser_args:
+        log(f"Loading Orbit audio capture extension: {resolved_extension_path}", session_id)
     return Browser(
         headless=headless,
         keep_alive=True,
@@ -113,6 +122,10 @@ def build_default_session_config(meet_url, session_id=None):
     resolved_session_id = session_id or f"manual-{meeting_code}"
     live_stt_enabled = env_bool("ORBIT_LIVE_STT_ENABLED", bool(os.environ.get("DEEPGRAM_API_KEY")))
     audio_ws_base_url = os.environ.get("ORBIT_AUDIO_WS_BASE_URL", "ws://127.0.0.1:8000").rstrip("/")
+    audio_stream_token = secrets.token_urlsafe(24) if live_stt_enabled else None
+    audio_stream_ws_url = f"{audio_ws_base_url}/internal/audio-stream/{resolved_session_id}"
+    if audio_stream_token:
+        audio_stream_ws_url = f"{audio_stream_ws_url}?{urlencode({'token': audio_stream_token})}"
     return MeetingSessionConfig(
         session_id=resolved_session_id,
         meet_url=meet_url,
@@ -121,7 +134,8 @@ def build_default_session_config(meet_url, session_id=None):
         max_steps=env_int("GMEET_BROWSER_USE_MAX_STEPS", 20),
         model_name=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
         live_stt_enabled=live_stt_enabled,
-        audio_stream_ws_url=f"{audio_ws_base_url}/internal/audio-stream/{resolved_session_id}",
+        audio_stream_ws_url=audio_stream_ws_url,
+        audio_stream_token=audio_stream_token,
     )
 
 

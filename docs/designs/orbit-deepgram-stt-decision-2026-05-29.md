@@ -3,6 +3,10 @@
 Reviewed on 2026-05-29
 Skills used: office-hours, plan-ceo-review, plan-eng-review
 
+## Implementation Note
+
+This document is a historical pre-implementation decision review. The repo now includes a local live STT path using a Manifest V3 Chrome extension, Orbit-owned Deepgram streaming, optional Google Meet caption speaker attribution, and transcript memory storage. See [`../live-stt.md`](../live-stt.md) for the current implementation and local setup.
+
 ## Decision
 
 Do not pause the baseline reliability work to build full STT now.

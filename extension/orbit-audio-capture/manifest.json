@@ -2,11 +2,11 @@
   "manifest_version": 3,
   "name": "Orbit Meet Audio Capture",
   "version": "0.1.0",
+  "minimum_chrome_version": "116",
   "description": "Captures Google Meet tab audio for Orbit live transcription.",
   "permissions": [
     "activeTab",
     "offscreen",
-    "scripting",
     "storage",
     "tabCapture",
     "tabs"
