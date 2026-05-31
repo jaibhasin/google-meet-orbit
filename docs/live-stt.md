@@ -47,6 +47,7 @@ DEEPGRAM_LIVE_MODEL=nova-3
 ORBIT_LIVE_STT_ENABLED=true
 ORBIT_AUDIO_WS_BASE_URL=ws://127.0.0.1:8000
 ORBIT_CHROME_EXTENSION_PATH=extension/orbit-audio-capture
+ORBIT_AUDIO_CAPTURE_STRATEGY=chrome_extension
 ORBIT_EXTENSION_CAPTURE_SHORTCUT=Alt+Shift+O
 ```
 
@@ -69,6 +70,8 @@ The webhook command handler only routes commands to tool wrappers. Capture start
 ## Chrome And Extension
 
 For local development, the extension is loaded unpacked from `extension/orbit-audio-capture`. There is no Chrome Web Store deployment step.
+
+`ORBIT_AUDIO_CAPTURE_STRATEGY` currently controls session metadata only. `chrome_extension` is the active default path; `server_audio_sink` exists as a future implementation and is not wired into the running meeting capture flow yet.
 
 When using `ORBIT_CHROME_CDP_URL` with an already-running Chrome process, load the unpacked extension manually first:
 

@@ -12,6 +12,7 @@ from orbit.agent.tools._shared import (
     _to_iso_string,
 )
 from orbit.capture_dispatcher import enqueue_meeting_capture
+from orbit.audio_capture import get_audio_capture_strategy
 from orbit.core import log
 from orbit.meeting_intelligence_repository import build_meeting_intelligence_repository
 from orbit.meeting_intelligence_service import (
@@ -158,7 +159,7 @@ async def request_meeting_capture(gmeet_url: str, requested_by_person_id: str) -
     capture_session = await store.create_capture_session(
         meeting_id,
         source_id,
-        capture_strategy="chrome_extension",
+        capture_strategy=get_audio_capture_strategy(),
         stt_provider="deepgram",
     )
     capture_session_id = capture_session.get("id") if capture_session else None

@@ -395,6 +395,7 @@ Fallback/debug live audio stream from a PulseAudio/PipeWire monitor source:
 | `ORBIT_LIVE_STT_ENABLED` | Enable live Meet audio transcription, defaults on when `DEEPGRAM_API_KEY` is set |
 | `ORBIT_AUDIO_WS_BASE_URL` | Local WebSocket base URL for extension audio, default `ws://127.0.0.1:8000` |
 | `ORBIT_CHROME_EXTENSION_PATH` | Unpacked MV3 extension path, default `extension/orbit-audio-capture` |
+| `ORBIT_AUDIO_CAPTURE_STRATEGY` | Audio capture strategy: `chrome_extension` (default) or `server_audio_sink` |
 | `ORBIT_CHROME_CDP_URL` | Existing headed Chrome CDP URL for browser-use to connect to |
 | `ORBIT_EXTENSION_CAPTURE_SHORTCUT` | Shortcut used to activate extension capture, default `Alt+Shift+O` |
 | `DATABASE_URL` | Enables meeting persistence + memory features |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -431,6 +432,16 @@ class MeetingCaptureStatusToolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RequestMeetingCaptureToolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._orig_strategy = os.environ.get("ORBIT_AUDIO_CAPTURE_STRATEGY")
+        os.environ.pop("ORBIT_AUDIO_CAPTURE_STRATEGY", None)
+
+    def tearDown(self):
+        if self._orig_strategy is None:
+            os.environ.pop("ORBIT_AUDIO_CAPTURE_STRATEGY", None)
+        else:
+            os.environ["ORBIT_AUDIO_CAPTURE_STRATEGY"] = self._orig_strategy
+
     async def test_request_meeting_capture_creates_source_and_meeting(self):
         store = FakeCaptureStore()
         with patch("orbit.agent.tools.meeting_tools._require_database_url", return_value="postgresql://example"):
