@@ -19,12 +19,11 @@ The product thesis is narrower than "a WhatsApp bot": Orbit is trying to answer 
 - Normalizes final transcript segments before writing them into persistent storage.
 - Uses Google Meet captions as a best-effort speaker attribution layer when available.
 - Detects `@orbit` mentions inside Meet chat.
-- Starts meetings from WhatsApp via Twilio.
-- Sends WhatsApp status updates while meetings are running.
-- Handles natural WhatsApp controls such as status, list active meetings, leave, stop recording, and `/new`.
-- Answers live meeting recall questions from active Deepgram transcript segments when live STT is running.
-- Answers normal WhatsApp questions from persistent company memory when `DATABASE_URL` is configured.
-- Labels normal WhatsApp answers as memory-backed recall or general fallback so users can tell when Orbit is grounded in stored company context.
+- Starts meetings from WhatsApp via deterministic commands over Twilio.
+- Schedules capture jobs through `request_meeting_capture` and backend session dispatch.
+- Supports deterministic WhatsApp commands: `join`, `status`, `summary`, `decisions`, `actions`, `recent`, and `open actions`.
+- Keeps the command handler deterministic and tool-based (no direct Chrome/Deepgram/LLM calls in command parsing).
+- Returns meeting intelligence summaries and counts from persisted meeting artifacts.
 - Stores meeting source/metadata/transcript chunks/extraction outputs through Postgres tables.
 
 ## Architecture
@@ -36,9 +35,16 @@ WhatsApp / Twilio
 FastAPI webhook
       |
       v
-OrbitWhatsAppService
+Deterministic command handler
       |
-      +--> Google Meet agent
+      v
+Agent tool wrappers
+      |
+      +--> request_meeting_capture -> capture dispatcher
+      |
+      +--> Meeting intelligence reads
+      |
+      +--> Google Meet session worker
       |       |
       |       v
       |   Browser Use + Chrome
@@ -102,13 +108,13 @@ For the live STT flow, see [docs/live-stt.md](docs/live-stt.md).
 
 ### 1. Start a meeting from WhatsApp
 
-Send a Google Meet link to the configured WhatsApp number:
+Send a deterministic command to the configured WhatsApp number:
 
 ```text
-https://meet.google.com/abc-defg-hij
+join https://meet.google.com/abc-defg-hij
 ```
 
-Orbit starts a browser session, attempts to join the meeting, and sends status updates back to WhatsApp.
+Orbit validates the Meet URL and sender, creates `sources` and `meetings` records, schedules capture, and replies with `meeting_id` and `status`.
 
 ### 2. Capture meeting chat
 
@@ -116,62 +122,30 @@ After joining, Orbit opens the Google Meet chat panel, sends an intro message, s
 
 Captured messages are stored in memory when persistent memory is enabled.
 
-### 3. Control active meetings from WhatsApp
+### 3. Check capture status and intelligence
 
-Send natural controls such as:
-
-```text
-status
-list active meetings
-stop monitoring
-leave abc-defg-hij
-/new
-```
-
-`leave`, `stop recording`, and `stop monitoring` all end the selected Orbit session. If multiple meetings are active, include the meeting code; Orbit does not merge multiple active meetings. `/new` only resets the WhatsApp dialogue context and never stops a meeting.
-
-### 4. Ask live meeting questions
-
-Use `@orbit` or `orbit:` on WhatsApp to ask about currently active Meet chat context:
+Use deterministic meeting-id based commands:
 
 ```text
-@orbit what did they decide about launch timing?
+status <meeting-id>
+summary <meeting-id>
+decisions <meeting-id>
+actions <meeting-id>
+recent
+open actions
 ```
 
-This path only uses live captured Meet chat.
+`summary`, `decisions`, and `actions` read persisted meeting intelligence artifacts.
 
-### 5. Capture live meeting transcripts
+### 4. Capture live meeting transcripts
 
 When live STT is enabled, Orbit posts a capture config into the Meet tab after joining. The local Chrome extension captures the Meet tab audio with `chrome.tabCapture`, streams PCM16 audio to Orbit's local WebSocket, and Orbit forwards the stream to Deepgram.
 
 Final Deepgram transcript segments are normalized, kept in a bounded in-memory live buffer for the active session, and stored in memory. Speaker names are optional: Meet caption scraping can enrich segments when it works, but audio-only transcripts still store normally.
 
-### 6. Ask what is happening live
+### 5. Persist and extract meeting intelligence
 
-Send a natural live-recall question:
-
-```text
-what are people discussing?
-summarize the meeting
-what happened in abc-defg-hij?
-```
-
-Orbit answers from the selected active meeting's live STT buffer only and cites transcript sources with meeting code, speaker when known, and timestamp. If live STT is unavailable, not started, or too sparse, Orbit says so instead of substituting historical company memory.
-
-### 7. Ask company-memory questions
-
-Send a normal WhatsApp question without `@orbit`:
-
-```text
-what did we last discuss about onboarding?
-```
-
-Orbit searches persistent company memory, generates an answer from retrieved context, and includes short source labels when available.
-
-Normal WhatsApp answers now expose the answer mode:
-
-- `Answer mode: memory-backed recall` means the response is grounded in stored Orbit memory.
-- `Answer mode: general fallback` means Orbit could not find enough stored company context, so the reply is a general model answer instead.
+After session completion, Orbit stores transcript chunks and extraction outputs, then persists structured `decisions`, `action_items`, and `memories` for retrieval.
 
 ## Setup
 
@@ -302,7 +276,7 @@ memories(
 
 Meeting lifecycle writes:
 
-1. incoming WhatsApp link creates/updates rows in `people`, `sources`, and `meetings`
+1. `join <meet-link>` resolves sender identity and creates rows in `sources` and `meetings`
 2. capture/save final transcript into `source_chunks`
 3. extraction runs save structured JSON into `extraction_runs.output_json`
 4. extracted arrays are persisted into `decisions`, `action_items`, and `memories`
@@ -360,46 +334,46 @@ ngrok http 8001
 ## WhatsApp Commands
 
 ```text
-https://meet.google.com/abc-defg-hij
+join https://meet.google.com/abc-defg-hij
 ```
 
-Starts Orbit for that meeting.
+Creates and schedules capture for that meeting.
 
 ```text
-@orbit what is happening in the meeting?
+status <meeting-id>
 ```
 
-Answers from live captured Meet chat.
+Returns capture status and timestamps.
 
 ```text
-status
+summary <meeting-id>
 ```
 
-Lists active meetings with status, chat count, and live STT state.
+Returns meeting summary and counts for decisions, action items, and memories.
 
 ```text
-stop recording abc-defg-hij
+decisions <meeting-id>
 ```
 
-Stops monitoring the selected active meeting and reports after cleanup.
+Returns extracted decisions for the meeting.
 
 ```text
-/new
+actions <meeting-id>
 ```
 
-Resets WhatsApp dialogue context only.
+Returns extracted action items for the meeting.
 
 ```text
-summarize the meeting
+recent
 ```
 
-Answers from active live STT transcript segments with citations.
+Lists recent meetings.
 
 ```text
-what did we discuss about hiring?
+open actions
 ```
 
-Answers from persistent company memory.
+Lists currently open action items.
 
 Fallback/debug live audio stream from a PulseAudio/PipeWire monitor source:
 

@@ -5,6 +5,9 @@ Skills used: health, plan-eng-review
 Repo: jaibhasin/google-meet-orbit
 Branch: main
 
+Historical snapshot note:
+This document captures repo state as of 2026-05-29. Some statements below are no longer current (for example CI/workflow presence and command-handler architecture).
+
 ## Executive Assessment
 
 Orbit is technically competent for an early prototype. The repo shows real system thinking: a working WhatsApp control plane, isolated Google Meet automation, a clear memory boundary, Postgres + pgvector persistence, and tests around the highest-value service paths.

@@ -58,6 +58,13 @@ python scripts/whatsapp_bot.py
 ```
 
 Then start a meeting through WhatsApp by sending a Meet URL.
+Use the deterministic command format:
+
+```text
+join https://meet.google.com/abc-defg-hij
+```
+
+The webhook command handler only routes commands to tool wrappers. Capture startup is scheduled through backend dispatch (`request_meeting_capture` -> capture dispatcher -> session worker), not by direct Chrome/Deepgram calls in command parsing.
 
 ## Chrome And Extension
 
