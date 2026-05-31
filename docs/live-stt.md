@@ -71,7 +71,7 @@ The webhook command handler only routes commands to tool wrappers. Capture start
 
 For local development, the extension is loaded unpacked from `extension/orbit-audio-capture`. There is no Chrome Web Store deployment step.
 
-`ORBIT_AUDIO_CAPTURE_STRATEGY` currently controls session metadata only. `chrome_extension` is the active default path; `server_audio_sink` exists as a future implementation and is not wired into the running meeting capture flow yet.
+`ORBIT_AUDIO_CAPTURE_STRATEGY` controls the capture path. `chrome_extension` is the active default strategy, and `server_audio_sink` is available for server-side capture on supporting runtimes.
 
 When using `ORBIT_CHROME_CDP_URL` with an already-running Chrome process, load the unpacked extension manually first:
 
@@ -144,6 +144,57 @@ The fallback script is for debugging only:
 ```
 
 Use this only when debugging local PulseAudio/PipeWire monitor sources. It is not the primary architecture.
+
+## Server Audio Sink Verification
+
+Use this to validate whether `server_audio_sink` can run on your machine before relying on it for live meetings.
+
+```bash
+export ORBIT_AUDIO_CAPTURE_STRATEGY=server_audio_sink
+python scripts/check_server_audio_sink.py
+```
+
+Expected output format:
+
+```text
+ffmpeg: ok
+pactl: ok
+pulse_compatibility: ok
+null_sink_create: ok
+sink_listed: ok
+ffmpeg_monitor_open: ok
+cleanup: ok
+```
+
+If a step fails, the script prints a likely fix suggestion after that step.
+
+One-meeting production smoke check:
+
+1. Start Orbit app (`python scripts/whatsapp_bot.py`).
+2. Send via WhatsApp: `join <meet-link>`.
+3. Check the created meeting capture session metadata:
+
+   - `capture_strategy = server_audio_sink`
+   - `metadata -> audio_capture -> strategy = server_audio_sink`
+   - `metadata -> audio_capture -> sink_name` exists
+   - `metadata -> audio_capture -> ffmpeg_pid` exists
+   - `metadata -> audio_capture -> routing_mode` reflects the active runtime
+   - `metadata -> audio_capture -> browser_audio_routed` is `true` when routing is active
+4. Confirm status reaches `streaming_audio`.
+5. Confirm audio health fields are increasing (`chunk_count`, `bytes_received`) and STT is connected.
+6. Confirm transcript chunks are produced in meeting capture results.
+
+Two-meeting parallel smoke check:
+
+1. Keep `ORBIT_AUDIO_CAPTURE_STRATEGY=server_audio_sink`.
+2. Start two Meet sessions at once.
+3. Confirm each meeting has distinct capture session metadata:
+   - different `capture_session_id`
+   - different `audio_capture.sink_name`
+   - different `audio_capture.ffmpeg_pid`
+4. Confirm both sessions report `streaming_audio` and both produce transcript chunks.
+
+If routing is not active for your runtime yet (for example shared-browser CDP mode), `routing_mode` will be `not_implemented` and `browser_audio_routed` will be `false`.
 
 ## Known Limits
 

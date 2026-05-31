@@ -66,6 +66,7 @@ async def get_meeting_capture_status(meeting_id: str) -> dict:
     )
     audio = capture_metadata["audio"]
     deepgram = capture_metadata["deepgram"]
+    audio_capture = capture_metadata.get("audio_capture") or {}
     return {
         "meeting_id": meeting["id"],
         "status": meeting["status"],
@@ -100,6 +101,17 @@ async def get_meeting_capture_status(meeting_id: str) -> dict:
             "interim_transcript_count": int(deepgram.get("interim_transcript_count") or 0),
             "keepalive_count": int(deepgram.get("keepalive_count") or 0),
             "last_keepalive_at": _to_iso_string(deepgram.get("last_keepalive_at")),
+        },
+        "audio_capture": {
+            "strategy": audio_capture.get("strategy"),
+            "sink_name": audio_capture.get("sink_name"),
+            "ffmpeg_pid": audio_capture.get("ffmpeg_pid"),
+            "routing_mode": audio_capture.get("routing_mode"),
+            "browser_audio_routed": audio_capture.get("browser_audio_routed"),
+            "browser_process_isolated": audio_capture.get("browser_process_isolated"),
+            "started_at": _to_iso_string(audio_capture.get("started_at")),
+            "stopped_at": _to_iso_string(audio_capture.get("stopped_at")),
+            "error": audio_capture.get("error"),
         },
     }
 
