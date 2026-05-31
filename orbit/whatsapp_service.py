@@ -388,6 +388,39 @@ class OrbitWhatsAppService:
 
             return {"status": "started", "meeting_code": meeting_code}
 
+    async def start_meeting_capture_session(self, meeting_id, meet_url, source_id=None):
+        if not meeting_id:
+            return {"status": "invalid_input"}
+
+        meeting_code = extract_meeting_code(meet_url)
+
+        async with self.lock:
+            if any(
+                active.state.meeting_code == meeting_code or active.meeting_id == meeting_id
+                for active in self.active_sessions.values()
+            ):
+                return {"status": "duplicate", "meeting_code": meeting_code}
+
+            if len(self.active_sessions) >= self.max_parallel_meetings:
+                return {"status": "capacity", "meeting_code": meeting_code}
+
+            session_id = self.build_session_id(meeting_code)
+            config = self.build_session_config(meet_url, session_id)
+            state = build_meeting_state(config)
+            active = ActiveMeeting(
+                session_id=session_id,
+                meet_url=meet_url,
+                state=state,
+                meeting_id=meeting_id,
+                source_id=source_id,
+                created_at=now_iso(),
+            )
+            # TODO: Replace this in-process task spawn with a durable queue/worker dispatch.
+            self.active_sessions[session_id] = active
+            active.task = asyncio.create_task(self._run_session(active, config))
+
+            return {"status": "started", "meeting_code": meeting_code, "session_id": session_id}
+
     async def _create_meeting_record(self, meet_url, from_number, profile_name=None):
         if not from_number:
             return None, None

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from orbit.agent.tools import (
     get_meeting_capture_status,
@@ -13,7 +13,7 @@ from orbit.agent.tools import (
     search_decisions,
     send_whatsapp_reply,
 )
-from orbit.agent.tools._shared import NotFoundError, ValidationError
+from orbit.agent.tools._shared import ConfigurationError, NotFoundError, ValidationError
 from orbit.meeting_intelligence_repository import MeetingIntelligenceRepository
 from orbit.meeting_intelligence_service import MeetingNotFoundError
 
@@ -316,14 +316,24 @@ class RequestMeetingCaptureToolTests(unittest.IsolatedAsyncioTestCase):
         with patch("orbit.agent.tools.meeting_tools._require_database_url", return_value="postgresql://example"):
             with patch("orbit.agent.tools.meeting_tools._query_row", return_value={"id": VALID_PERSON_ID}):
                 with patch("orbit.agent.tools.meeting_tools.build_meeting_store", return_value=store):
-                    result = await request_meeting_capture(
-                        gmeet_url="https://meet.google.com/abc-defg-hij",
-                        requested_by_person_id=VALID_PERSON_ID,
-                    )
+                    with patch(
+                        "orbit.agent.tools.meeting_tools.enqueue_meeting_capture",
+                        new_callable=AsyncMock,
+                    ) as enqueue_capture:
+                        result = await request_meeting_capture(
+                            gmeet_url="https://meet.google.com/abc-defg-hij",
+                            requested_by_person_id=VALID_PERSON_ID,
+                        )
+        enqueue_capture.assert_awaited_once_with(
+            "meeting-1",
+            gmeet_url="https://meet.google.com/abc-defg-hij",
+            source_id="source-1",
+            requested_by_person_id=VALID_PERSON_ID,
+        )
 
         self.assertEqual(result["meeting_id"], "meeting-1")
         self.assertEqual(result["status"], "created")
-        self.assertEqual(result["message"], "Meeting capture created.")
+        self.assertEqual(result["message"], "Meeting capture created and scheduled.")
 
         self.assertEqual(store.calls["create_source"], 1)
         self.assertEqual(store.calls["create_meeting"], 1)
@@ -332,6 +342,33 @@ class RequestMeetingCaptureToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.create_meeting_calls[0]["gmeet_url"], "https://meet.google.com/abc-defg-hij")
         self.assertEqual(store.create_meeting_calls[0]["requested_by_person_id"], VALID_PERSON_ID)
         self.assertEqual(store.create_meeting_calls[0]["status"], "created")
+
+    async def test_request_meeting_capture_marks_failed_when_dispatch_fails(self):
+        store = FakeCaptureStore()
+        status_updates = []
+
+        async def update_meeting_status(meeting_id, status, **kwargs):
+            status_updates.append((meeting_id, status, kwargs))
+
+        store.update_meeting_status = update_meeting_status
+
+        with patch("orbit.agent.tools.meeting_tools._require_database_url", return_value="postgresql://example"):
+            with patch("orbit.agent.tools.meeting_tools._query_row", return_value={"id": VALID_PERSON_ID}):
+                with patch("orbit.agent.tools.meeting_tools.build_meeting_store", return_value=store):
+                    with patch(
+                        "orbit.agent.tools.meeting_tools.enqueue_meeting_capture",
+                        new_callable=AsyncMock,
+                        side_effect=RuntimeError("Queue not available"),
+                    ):
+                        with self.assertRaises(ConfigurationError) as exc_info:
+                            await request_meeting_capture(
+                                gmeet_url="https://meet.google.com/abc-defg-hij",
+                                requested_by_person_id=VALID_PERSON_ID,
+                            )
+
+        self.assertEqual(exc_info.exception.code, "MEETING_CAPTURE_DISPATCH_FAILED")
+        self.assertEqual(len(status_updates), 1)
+        self.assertEqual(status_updates[0][1], "failed")
 
 
 class ToolInputValidationTests(unittest.IsolatedAsyncioTestCase):
@@ -718,10 +755,16 @@ class ToolSafetyRegressionTests(unittest.IsolatedAsyncioTestCase):
         with patch("orbit.agent.tools.meeting_tools._require_database_url", return_value="postgresql://example"):
             with patch("orbit.agent.tools.meeting_tools._query_row", side_effect=_query_row):
                 with patch("orbit.agent.tools.meeting_tools.build_meeting_store", return_value=store):
-                    await request_meeting_capture(
-                        gmeet_url="https://meet.google.com/abc-defg-hij",
-                        requested_by_person_id=VALID_PERSON_ID,
-                    )
+                    with patch(
+                        "orbit.agent.tools.meeting_tools.enqueue_meeting_capture",
+                        new_callable=AsyncMock,
+                    ) as enqueue_capture:
+                        await request_meeting_capture(
+                            gmeet_url="https://meet.google.com/abc-defg-hij",
+                            requested_by_person_id=VALID_PERSON_ID,
+                        )
+
+        enqueue_capture.assert_awaited_once()
 
         self.assertEqual(store.calls["create_source"], 1)
         self.assertEqual(store.calls["create_meeting"], 1)

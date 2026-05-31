@@ -99,9 +99,9 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "orbit.agent.whatsapp.command_handler.request_meeting_capture",
                 new_callable=AsyncMock,
                 return_value={
-                    "meeting_id": VALID_MEETING_ID,
+                "meeting_id": VALID_MEETING_ID,
                     "status": "created",
-                    "message": "Meeting capture created.",
+                    "message": "Meeting capture created and scheduled.",
                 },
             ) as request_capture:
                 reply = await handle_whatsapp_command(
@@ -113,7 +113,7 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
             gmeet_url="https://meet.google.com/abc-defg-hij",
             requested_by_person_id=VALID_PERSON_ID,
         )
-        self.assertIn("Meeting capture created.", reply)
+        self.assertIn("Meeting capture created and scheduled.", reply)
         self.assertIn(f"Meeting ID: {VALID_MEETING_ID}", reply)
         self.assertIn("Status: created", reply)
 

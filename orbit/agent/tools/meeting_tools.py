@@ -11,6 +11,8 @@ from orbit.agent.tools._shared import (
     _require_uuid,
     _to_iso_string,
 )
+from orbit.capture_dispatcher import enqueue_meeting_capture
+from orbit.core import log
 from orbit.meeting_intelligence_repository import build_meeting_intelligence_repository
 from orbit.meeting_intelligence_service import (
     MeetingIntelligenceService,
@@ -110,11 +112,40 @@ async def request_meeting_capture(gmeet_url: str, requested_by_person_id: str) -
             message="Failed to create meeting record for the request.",
         )
 
-    # TODO: enqueue a capture job using the project's queue/worker abstraction when added.
+    log(
+        f"Created meeting capture: meeting_id={meeting_id}, source_id={source_id}, requested_by_person_id={requested_by_person_id}",
+        level="info",
+    )
+
+    try:
+        await enqueue_meeting_capture(
+            meeting_id,
+            gmeet_url=gmeet_url,
+            source_id=source_id,
+            requested_by_person_id=requested_by_person_id,
+        )
+    except Exception:
+        try:
+            await store.update_meeting_status(meeting_id, "failed")
+        except Exception as error:
+            log(
+                f"Failed to mark meeting as failed after dispatch failure. meeting_id={meeting_id}: {error}",
+                level="error",
+            )
+
+        log(
+            f"Failed to dispatch capture job. meeting_id={meeting_id}, source_id={source_id}, requested_by_person_id={requested_by_person_id}",
+            level="error",
+        )
+        raise ConfigurationError(
+            code="MEETING_CAPTURE_DISPATCH_FAILED",
+            message="Meeting capture was created but could not be scheduled. Please retry in a moment.",
+        )
+
     return {
         "meeting_id": meeting_id,
         "status": "created",
-        "message": "Meeting capture created.",
+        "message": "Meeting capture created and scheduled.",
     }
 
 

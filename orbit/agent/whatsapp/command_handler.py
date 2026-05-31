@@ -114,10 +114,10 @@ async def handle_whatsapp_command(from_number: str, body: str) -> str:
             )
             reply = _safe_response_text(
                 [
-                    "Meeting capture created.",
+                    capture.get("message") or "Meeting capture scheduled.",
                     "",
                     f"Meeting ID: {capture.get('meeting_id')}",
-                    f"Status: {capture.get('status')}",
+                    f"Status: {capture.get('status', 'created')}",
                 ]
             )
             return reply
