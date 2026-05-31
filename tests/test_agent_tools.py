@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 from orbit.agent.tools import (
     get_meeting_capture_status,
@@ -532,6 +533,18 @@ class ToolInputValidationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(exc_info.exception.code, "INVALID_PERSON_ID")
+
+    async def test_request_capture_accepts_native_uuid_person_id(self):
+        person_id = UUID(VALID_PERSON_ID)
+        with patch("orbit.agent.tools.meeting_tools._require_database_url", return_value="postgresql://example"):
+            with patch("orbit.agent.tools.meeting_tools._query_row", new_callable=AsyncMock, return_value=None) as query_row:
+                with self.assertRaises(NotFoundError):
+                    await request_meeting_capture(
+                        gmeet_url="https://meet.google.com/abc-defg-hij",
+                        requested_by_person_id=person_id,
+                    )
+
+        self.assertEqual(query_row.await_args.args[2], (VALID_PERSON_ID,))
 
     async def test_invalid_uuid_for_whatsapp_reply(self):
         with self.assertRaises(ValidationError) as exc_info:

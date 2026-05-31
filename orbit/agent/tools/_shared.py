@@ -59,8 +59,8 @@ def _require_database_url() -> str:
     return database_url
 
 
-def _require_uuid(value: str, *, field_name: str, error_code: str, required_message: str) -> str:
-    text = (value or "").strip()
+def _require_uuid(value: str | UUID, *, field_name: str, error_code: str, required_message: str) -> str:
+    text = str(value or "").strip()
     try:
         UUID(text)
     except (TypeError, ValueError):
