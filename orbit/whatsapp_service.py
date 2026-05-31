@@ -1183,6 +1183,8 @@ class OrbitWhatsAppService:
 
         summary_short, summary_long = self._build_meeting_summary(state)
         ended_at = state.finished_at or now_iso()
+        final_summary_short = summary_short
+        final_summary_long = summary_long
         try:
             await store.update_meeting_status(
                 active.meeting_id,
@@ -1204,23 +1206,46 @@ class OrbitWhatsAppService:
                 ended_at=ended_at,
                 skip_status_updates=True,
             )
+            extraction_output = extraction.get("output_json") if isinstance(extraction, dict) else None
+            if isinstance(extraction_output, dict):
+                extracted_summary_short = extraction_output.get("summary_short")
+                extracted_summary_long = extraction_output.get("summary_long")
+                if isinstance(extracted_summary_short, str) and extracted_summary_short.strip():
+                    final_summary_short = extracted_summary_short.strip()
+                if isinstance(extracted_summary_long, str) and extracted_summary_long.strip():
+                    final_summary_long = extracted_summary_long.strip()
+
             if extraction.get("status") == "failed":
                 await store.update_meeting_status(
                     active.meeting_id,
                     "failed",
                     ended_at=ended_at,
                     started_at=state.joined_at,
-                    summary_short=summary_short,
-                    summary_long=summary_long,
+                    summary_short=final_summary_short,
+                    summary_long=final_summary_long,
+                    overwrite_summary=True,
                 )
                 return
+
+            if final_summary_short != summary_short or final_summary_long != summary_long:
+                await store.update_meeting_status(
+                    active.meeting_id,
+                    "processing",
+                    ended_at=ended_at,
+                    started_at=state.joined_at,
+                    summary_short=final_summary_short,
+                    summary_long=final_summary_long,
+                    overwrite_summary=True,
+                )
+
             await store.update_meeting_status(
                 active.meeting_id,
                 "processed",
                 ended_at=ended_at,
                 started_at=state.joined_at,
-                summary_short=summary_short,
-                summary_long=summary_long,
+                summary_short=final_summary_short,
+                summary_long=final_summary_long,
+                overwrite_summary=True,
             )
         except Exception as error:
             log(
@@ -1233,8 +1258,9 @@ class OrbitWhatsAppService:
                     "failed",
                     ended_at=ended_at,
                     started_at=state.joined_at,
-                    summary_short=summary_short,
-                    summary_long=summary_long,
+                    summary_short=final_summary_short,
+                    summary_long=final_summary_long,
+                    overwrite_summary=True,
                 )
             except Exception as failed_error:
                 log(

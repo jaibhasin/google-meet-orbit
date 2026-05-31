@@ -804,7 +804,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         fields = store.updates[-1]["fields"]
         self.assertEqual(fields["ended_at"], "2026-05-31T11:00:00")
         self.assertEqual(fields["started_at"], "2026-05-31T10:00:00")
-        self.assertIn("chat messages captured", fields["summary_short"])
+        self.assertEqual(fields["summary_short"], "Orbit recap")
 
     async def test_run_meeting_extraction_persists_decisions(self):
         store = FakeMeetingStore()

@@ -156,7 +156,12 @@ async def handle_whatsapp_command(from_number: str, body: str) -> str:
                     ]
                 ).strip()
 
-            summary_short = _format_summary_text(payload.get("meeting", {}).get("summary_short"))
+            meeting_payload = payload.get("meeting") or {}
+            summary_short = _format_summary_text(
+                meeting_payload.get("summary_long")
+                if (meeting_payload.get("summary_long") or "").strip()
+                else meeting_payload.get("summary_short")
+            )
             reply = _safe_response_text(
                 [
                     "Summary:",

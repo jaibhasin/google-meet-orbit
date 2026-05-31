@@ -163,6 +163,35 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(reply, "Summary:\nPlanning completed.\n\nDecisions: 2\nAction items: 1\nMemories: 3")
 
+    async def test_summary_prefers_summary_long_when_available(self):
+        with patch("orbit.agent.whatsapp.command_handler.resolve_person_id_by_whatsapp_phone", return_value=VALID_PERSON_ID):
+            with patch(
+                "orbit.agent.whatsapp.command_handler.get_meeting_intelligence",
+                new_callable=AsyncMock,
+                return_value={
+                    "meeting": {
+                        "id": VALID_MEETING_ID,
+                        "summary_short": "live STT requested; 1 chat messages captured",
+                        "summary_long": "Team decided to extend launch by one week.",
+                    },
+                    "meta": {
+                        "is_ready": True,
+                        "decision_count": 2,
+                        "action_item_count": 1,
+                        "memory_count": 3,
+                    },
+                },
+            ):
+                reply = await handle_whatsapp_command(
+                    "whatsapp:+15551230000",
+                    f"summary {VALID_MEETING_ID}",
+                )
+
+        self.assertEqual(
+            reply,
+            "Summary:\nTeam decided to extend launch by one week.\n\nDecisions: 2\nAction items: 1\nMemories: 3",
+        )
+
     async def test_summary_when_not_ready_returns_status_and_message(self):
         with patch("orbit.agent.whatsapp.command_handler.resolve_person_id_by_whatsapp_phone", return_value=VALID_PERSON_ID):
             with patch(

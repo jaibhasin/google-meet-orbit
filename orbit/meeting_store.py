@@ -158,6 +158,7 @@ class DisabledMeetingStore:
         ended_at: str | None = None,
         summary_short: str | None = None,
         summary_long: str | None = None,
+        overwrite_summary: bool = False,
     ) -> None:
         return None
 
@@ -562,6 +563,7 @@ class PostgresMeetingStore:
         ended_at: str | None = None,
         summary_short: str | None = None,
         summary_long: str | None = None,
+        overwrite_summary: bool = False,
     ) -> None:
         if not meeting_id:
             return
@@ -577,10 +579,16 @@ class PostgresMeetingStore:
             updates.append("ended_at = COALESCE(ended_at, %s)")
             values.append(ended_at)
         if summary_short is not None:
-            updates.append("summary_short = COALESCE(summary_short, %s)")
+            if overwrite_summary:
+                updates.append("summary_short = %s")
+            else:
+                updates.append("summary_short = COALESCE(summary_short, %s)")
             values.append(summary_short)
         if summary_long is not None:
-            updates.append("summary_long = COALESCE(summary_long, %s)")
+            if overwrite_summary:
+                updates.append("summary_long = %s")
+            else:
+                updates.append("summary_long = COALESCE(summary_long, %s)")
             values.append(summary_long)
 
         values.append(meeting_id)
