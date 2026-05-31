@@ -93,6 +93,21 @@ class LiveSTTSession:
         self.audio_chunks_received += 1
         await self.transcriber.send_audio(chunk)
 
+    async def send_keepalive(self) -> bool:
+        if self.closed or self.transcriber is None:
+            return False
+        send_keepalive = getattr(self.transcriber, "send_keepalive", None)
+        if not callable(send_keepalive):
+            return False
+        try:
+            sent = await send_keepalive()
+        except Exception as error:
+            await self._emit_health_event("keepalive_failed", error=str(error))
+            return False
+        if sent:
+            await self._emit_health_event("keepalive")
+        return bool(sent)
+
     def add_captions(self, captions: list[CaptionSnippet]) -> None:
         if not captions:
             return

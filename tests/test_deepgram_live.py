@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 import unittest
 
-from orbit.deepgram_live import DeepgramLiveConfig, deepgram_live_url, parse_deepgram_payload
+from orbit.deepgram_live import (
+    DeepgramLiveConfig,
+    DeepgramLiveTranscriber,
+    deepgram_live_url,
+    parse_deepgram_payload,
+)
 
 
 class DeepgramLiveTests(unittest.TestCase):
@@ -82,6 +87,25 @@ class DeepgramLiveTests(unittest.TestCase):
         payload = json.loads('{"type":"Metadata"}')
 
         self.assertEqual(parse_deepgram_payload(payload), [])
+
+
+class DeepgramLiveTranscriberTests(unittest.IsolatedAsyncioTestCase):
+    async def test_keepalive_uses_deepgram_control_message(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, payload):
+                self.sent.append(payload)
+
+        websocket = FakeWebSocket()
+        transcriber = DeepgramLiveTranscriber(api_key="key")
+        transcriber._ws = websocket
+
+        sent = await transcriber.send_keepalive()
+
+        self.assertTrue(sent)
+        self.assertEqual(json.loads(websocket.sent[0]), {"type": "KeepAlive"})
 
 
 if __name__ == "__main__":

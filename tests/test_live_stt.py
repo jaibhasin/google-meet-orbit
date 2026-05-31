@@ -47,6 +47,7 @@ class FakeTranscriber:
         self.messages = messages or []
         self.connect_error = connect_error
         self.audio_chunks = []
+        self.keepalives = 0
         self.closed = False
 
     async def connect(self):
@@ -56,6 +57,10 @@ class FakeTranscriber:
 
     async def send_audio(self, chunk):
         self.audio_chunks.append(chunk)
+
+    async def send_keepalive(self):
+        self.keepalives += 1
+        return True
 
     async def receive(self):
         for message in self.messages:
@@ -214,11 +219,14 @@ class LiveSTTTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await session.send_audio(b"pcm")
+        await session.send_keepalive()
         await session.process_deepgram_message(final_deepgram_message("sensitive transcript"))
         await session.close()
 
         self.assertEqual(events[0][0], "connect_started")
         self.assertEqual(events[1][0], "connected")
+        self.assertIn(("keepalive", {}), events)
+        self.assertEqual(fake.keepalives, 1)
         transcript_event = next(details for event, details in events if event == "transcript")
         self.assertEqual(transcript_event, {"is_final": True})
         self.assertNotIn("sensitive transcript", str(events))

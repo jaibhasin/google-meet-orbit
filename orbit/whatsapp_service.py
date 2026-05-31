@@ -14,6 +14,13 @@ from orbit.core import (
     log,
     now_iso,
 )
+from orbit.audio_vad import (
+    DEFAULT_POST_ROLL_MS,
+    DEFAULT_PRE_ROLL_MS,
+    DEFAULT_SILENCE_DROP_AFTER_MS,
+    DEFAULT_SILENCE_RMS_THRESHOLD,
+    PCM16SilenceGate,
+)
 from orbit.meet import build_default_session_config, run_meeting_session
 from orbit.meet_types import (
     ChatMessage,
@@ -73,6 +80,7 @@ STOP_TIMEOUT_SECONDS = 10
 CAPTURE_HEARTBEAT_INTERVAL_SECONDS = 15
 CAPTURE_AUDIO_METADATA_FLUSH_CHUNKS = 25
 CAPTURE_AUDIO_METADATA_FLUSH_INTERVAL_SECONDS = 5
+DEEPGRAM_KEEPALIVE_INTERVAL_SECONDS = 5
 MEETING_EXTRACTION_PROMPT_VERSION = "meeting-extractor-v1"
 MEETING_EXTRACTION_RUN_TYPE = "full_meeting_extraction"
 MEETING_EXTRACT_PROMPT = """You are extracting structured company memory from a meeting transcript.
@@ -122,6 +130,8 @@ class ActiveMeeting:
     capture_health_metadata: dict = field(default_factory=default_capture_session_metadata)
     audio_chunks_since_metadata_flush: int = 0
     last_capture_metadata_flush_at: float = 0.0
+    audio_silence_gate: PCM16SilenceGate | None = None
+    last_deepgram_keepalive_at: float = 0.0
 
 
 @dataclass
@@ -660,6 +670,12 @@ class OrbitWhatsAppService:
                 update["first_transcript_at"] = timestamp
             counter = "final_transcript_count" if details.get("is_final") else "interim_transcript_count"
             update[counter] = int(deepgram.get(counter) or 0) + 1
+        elif event == "keepalive":
+            update["keepalive_count"] = int(deepgram.get("keepalive_count") or 0) + 1
+            update["last_keepalive_at"] = timestamp
+        elif event == "keepalive_failed":
+            update["error"] = self._safe_capture_error(details.get("error"))
+            failure = ("DEEPGRAM_KEEPALIVE_FAILED", "Deepgram live transcription KeepAlive failed.")
         else:
             return
 
@@ -693,10 +709,73 @@ class OrbitWhatsAppService:
         audio = self._audio_health(active)
         audio["bytes_forwarded_to_stt"] = int(audio.get("bytes_forwarded_to_stt") or 0) + chunk_size
 
+    def _record_audio_classification(self, active, result):
+        audio = self._audio_health(active)
+        timestamp = now_iso()
+        audio["last_rms"] = round(result.rms, 2)
+        audio["silence_gated"] = result.silence_gated
+        if result.is_silent:
+            audio["silent_chunk_count"] = int(audio.get("silent_chunk_count") or 0) + 1
+            audio["silent_or_empty_chunk_count"] = int(audio.get("silent_or_empty_chunk_count") or 0) + 1
+            audio["last_silence_at"] = timestamp
+        else:
+            audio["speech_chunk_count"] = int(audio.get("speech_chunk_count") or 0) + 1
+            audio["last_speech_at"] = timestamp
+        if result.dropped_silence_bytes:
+            audio["bytes_dropped_silence"] = (
+                int(audio.get("bytes_dropped_silence") or 0) + result.dropped_silence_bytes
+            )
+
     def _record_empty_audio_chunk(self, active):
         audio = self._audio_health(active)
         audio["silent_or_empty_chunk_count"] = int(audio.get("silent_or_empty_chunk_count") or 0) + 1
         active.audio_chunks_since_metadata_flush += 1
+
+    def _get_or_create_audio_silence_gate(self, active, audio_format=None):
+        if active.audio_silence_gate is None:
+            sample_rate = audio_format.sample_rate if audio_format else 16000
+            active.audio_silence_gate = PCM16SilenceGate(
+                sample_rate=sample_rate,
+                rms_threshold=env_int(
+                    "ORBIT_AUDIO_SILENCE_RMS_THRESHOLD",
+                    DEFAULT_SILENCE_RMS_THRESHOLD,
+                ),
+                pre_roll_ms=env_int("ORBIT_AUDIO_PRE_ROLL_MS", DEFAULT_PRE_ROLL_MS),
+                post_roll_ms=env_int("ORBIT_AUDIO_POST_ROLL_MS", DEFAULT_POST_ROLL_MS),
+                silence_drop_after_ms=env_int(
+                    "ORBIT_AUDIO_SILENCE_DROP_AFTER_MS",
+                    DEFAULT_SILENCE_DROP_AFTER_MS,
+                ),
+            )
+            audio = self._audio_health(active)
+            audio["silence_gate_enabled"] = True
+            audio["silence_rms_threshold"] = active.audio_silence_gate.rms_threshold
+        return active.audio_silence_gate
+
+    async def _send_deepgram_keepalive_if_due(self, active, session):
+        if session is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if (
+            active.last_deepgram_keepalive_at
+            and now - active.last_deepgram_keepalive_at < DEEPGRAM_KEEPALIVE_INTERVAL_SECONDS
+        ):
+            return
+        send_keepalive = getattr(session, "send_keepalive", None)
+        if not callable(send_keepalive):
+            return
+        if await send_keepalive():
+            active.last_deepgram_keepalive_at = now
+
+    def _finish_audio_silence_gate(self, active):
+        gate = active.audio_silence_gate if active else None
+        if gate is None:
+            return
+        dropped_bytes = gate.finish()
+        if dropped_bytes:
+            audio = self._audio_health(active)
+            audio["bytes_dropped_silence"] = int(audio.get("bytes_dropped_silence") or 0) + dropped_bytes
+            active.audio_chunks_since_metadata_flush += 1
 
     async def _flush_capture_audio_health(self, active, *, force=False):
         if not active or not active.audio_chunks_since_metadata_flush:
@@ -1437,12 +1516,7 @@ class OrbitWhatsAppService:
                 "Live transcription cleanup failed.",
             )
             log(f"Live STT cleanup failed for Meet {state.meeting_code}: {error}", state.session_id, level="error")
-        if state.joined_at and state.live_stt_requested and not state.live_stt_started:
-            await self._mark_capture_session_failed(
-                active,
-                "AUDIO_STREAM_NOT_STARTED",
-                "Live audio streaming did not start before the meeting capture ended.",
-            )
+        await self._classify_ending_audio_health(active, state)
         if not state.joined_at:
             await self._mark_capture_session_failed(
                 active,
@@ -1470,6 +1544,36 @@ class OrbitWhatsAppService:
         if state.status == "waiting_for_host":
             await self.send_whatsapp_message(
                 f"Orbit stopped waiting for Meet {state.meeting_code} without being admitted."
+            )
+
+    async def _classify_ending_audio_health(self, active, state):
+        if not active or not state.joined_at or not state.live_stt_requested:
+            return
+        audio = self._audio_health(active)
+        deepgram = active.capture_health_metadata["deepgram"]
+        if int(audio.get("chunk_count") or 0) == 0:
+            await self._mark_capture_session_failed(
+                active,
+                "NO_AUDIO_CHUNKS_RECEIVED",
+                "No audio chunks were received before the meeting capture ended.",
+            )
+            return
+        if int(audio.get("speech_chunk_count") or 0) == 0:
+            await self._mark_capture_session_failed(
+                active,
+                "AUDIO_ONLY_SILENCE",
+                "Only silent audio was received before the meeting capture ended.",
+            )
+            return
+        transcript_count = (
+            int(deepgram.get("final_transcript_count") or 0)
+            + int(deepgram.get("interim_transcript_count") or 0)
+        )
+        if transcript_count == 0:
+            await self._mark_capture_session_failed(
+                active,
+                "NO_TRANSCRIPT_RECEIVED",
+                "No Deepgram transcript results were received before the meeting capture ended.",
             )
 
     async def _finalize_persistent_meeting(self, state):
@@ -1809,11 +1913,15 @@ class OrbitWhatsAppService:
                         await self._flush_capture_audio_health(active)
                         continue
                     self._record_audio_chunk_received(active, len(chunk))
-                    if session is None:
-                        session = await self.live_stt.get_or_create(active.state)
-                    await session.send_audio(chunk)
-                    self._record_audio_chunk_forwarded(active, len(chunk))
-                    if not active.state.live_stt_started:
+                    gate = self._get_or_create_audio_silence_gate(active)
+                    gate_result = gate.process(chunk)
+                    self._record_audio_classification(active, gate_result)
+                    for forwarded_chunk in gate_result.chunks_to_forward:
+                        if session is None:
+                            session = await self.live_stt.get_or_create(active.state)
+                        await session.send_audio(forwarded_chunk)
+                        self._record_audio_chunk_forwarded(active, len(forwarded_chunk))
+                    if gate_result.chunks_to_forward and not active.state.live_stt_started:
                         active.state.live_stt_started = True
                         active.state.live_stt_audio_confirmed_at = now_iso()
                         active.state.live_stt_status_detail = (
@@ -1834,6 +1942,8 @@ class OrbitWhatsAppService:
                     else:
                         await self._flush_capture_audio_health(active)
                         await self._heartbeat_capture_session(active)
+                    if gate_result.silence_gated:
+                        await self._send_deepgram_keepalive_if_due(active, session)
                     continue
 
                 raw_text = message.get("text")
@@ -1844,14 +1954,17 @@ class OrbitWhatsAppService:
                 message_type = payload.get("type")
                 if message_type in {"start", "config"}:
                     audio_format = LiveAudioFormat.from_payload(payload)
+                    self._get_or_create_audio_silence_gate(active, audio_format)
                     session = await self.live_stt.get_or_create(active.state, audio_format)
                     active.state.live_stt_status_detail = (
                         "Extension audio WebSocket connected. Waiting for the first audio chunk."
                     )
                     await websocket.send_json({"type": "ready"})
                 elif message_type == "stop":
+                    self._finish_audio_silence_gate(active)
                     break
         except Exception as error:
+            self._finish_audio_silence_gate(active)
             await self._flush_capture_audio_health(active, force=True)
             await self._mark_capture_session_failed(
                 active,
@@ -1865,6 +1978,7 @@ class OrbitWhatsAppService:
                 level="error",
             )
         finally:
+            self._finish_audio_silence_gate(active)
             await self._flush_capture_audio_health(active, force=True)
             try:
                 await self.live_stt.stop(session_id)

@@ -81,6 +81,14 @@ async def get_meeting_capture_status(meeting_id: str) -> dict:
             "chunk_count": int(audio.get("chunk_count") or 0),
             "bytes_received": int(audio.get("bytes_received") or 0),
             "bytes_forwarded_to_stt": int(audio.get("bytes_forwarded_to_stt") or 0),
+            "bytes_dropped_silence": int(audio.get("bytes_dropped_silence") or 0),
+            "speech_chunk_count": int(audio.get("speech_chunk_count") or 0),
+            "silent_chunk_count": int(audio.get("silent_chunk_count") or 0),
+            "silence_gate_enabled": bool(audio.get("silence_gate_enabled")),
+            "silence_gated": bool(audio.get("silence_gated")),
+            "last_rms": float(audio.get("last_rms") or 0),
+            "last_speech_at": _to_iso_string(audio.get("last_speech_at")),
+            "last_silence_at": _to_iso_string(audio.get("last_silence_at")),
         },
         "stt_health": {
             "provider": capture_session.get("stt_provider") if capture_session else None,
@@ -89,6 +97,7 @@ async def get_meeting_capture_status(meeting_id: str) -> dict:
             "last_transcript_at": _to_iso_string(deepgram.get("last_transcript_at")),
             "final_transcript_count": int(deepgram.get("final_transcript_count") or 0),
             "interim_transcript_count": int(deepgram.get("interim_transcript_count") or 0),
+            "keepalive_count": int(deepgram.get("keepalive_count") or 0),
             "last_keepalive_at": _to_iso_string(deepgram.get("last_keepalive_at")),
         },
     }

@@ -84,7 +84,14 @@ def _format_summary_text(summary_text: str | None) -> str:
 
 
 def _format_audio_health(audio_health: dict | None) -> str:
-    return "receiving" if (audio_health or {}).get("streaming_started") else "not started"
+    health = audio_health or {}
+    if int(health.get("chunk_count") or 0) == 0:
+        return "no chunks yet"
+    if health.get("silence_gated"):
+        return "silence gated"
+    if int(health.get("speech_chunk_count") or 0) > 0:
+        return "receiving speech"
+    return "receiving silence"
 
 
 def _format_stt_health(stt_health: dict | None) -> str:
@@ -92,6 +99,8 @@ def _format_stt_health(stt_health: dict | None) -> str:
     if not health.get("connected_at"):
         return "not connected"
     state = "closed" if health.get("connection_closed_at") else "connected"
+    if int(health.get("keepalive_count") or 0) > 0:
+        return f"{state}, keepalive active"
     return f"{state}, {int(health.get('final_transcript_count') or 0)} final segments"
 
 

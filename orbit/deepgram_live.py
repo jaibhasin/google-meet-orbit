@@ -146,8 +146,6 @@ class DeepgramLiveTranscriber:
             )
         # TODO: Add reconnect handling if live transcription should survive a
         # provider-side disconnect without restarting extension capture.
-        # TODO: Add Deepgram KeepAlive messages if the audio transport gains
-        # meaningful idle periods. Current extension capture continuously sends audio.
         return self
 
     async def send_audio(self, audio_chunk: bytes) -> None:
@@ -157,6 +155,12 @@ class DeepgramLiveTranscriber:
             await self.connect()
         assert self._ws is not None
         await self._ws.send(audio_chunk)
+
+    async def send_keepalive(self) -> bool:
+        if self._ws is None:
+            return False
+        await self._ws.send(json.dumps({"type": "KeepAlive"}))
+        return True
 
     async def receive(self):
         if self._ws is None:

@@ -374,12 +374,17 @@ class MeetingCaptureStatusToolTests(unittest.IsolatedAsyncioTestCase):
                         "chunk_count": 7,
                         "bytes_received": 700,
                         "bytes_forwarded_to_stt": 700,
+                        "bytes_dropped_silence": 200,
+                        "speech_chunk_count": 3,
+                        "silent_chunk_count": 4,
+                        "silence_gated": True,
                     },
                     "deepgram": {
                         "connected_at": "2026-05-31T10:01:30+00:00",
                         "last_transcript_at": "2026-05-31T10:01:59+00:00",
                         "final_transcript_count": 2,
                         "interim_transcript_count": 0,
+                        "keepalive_count": 1,
                     },
                 },
             }
@@ -402,8 +407,12 @@ class MeetingCaptureStatusToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["audio_health"]["streaming_started"])
         self.assertEqual(payload["audio_health"]["chunk_count"], 7)
         self.assertEqual(payload["audio_health"]["bytes_forwarded_to_stt"], 700)
+        self.assertEqual(payload["audio_health"]["bytes_dropped_silence"], 200)
+        self.assertEqual(payload["audio_health"]["speech_chunk_count"], 3)
+        self.assertTrue(payload["audio_health"]["silence_gated"])
         self.assertEqual(payload["stt_health"]["provider"], "deepgram")
         self.assertEqual(payload["stt_health"]["final_transcript_count"], 2)
+        self.assertEqual(payload["stt_health"]["keepalive_count"], 1)
 
     async def test_get_meeting_capture_status_returns_processed_payload(self):
         meeting = build_meeting_payload(VALID_MEETING_ID, status="processed")
