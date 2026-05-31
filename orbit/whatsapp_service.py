@@ -66,6 +66,7 @@ LIVE_RECALL_MAX_SEGMENTS = 30
 LIVE_RECAP_MAX_SEGMENTS = 40
 LIVE_RECALL_MAX_PROMPT_CHARS = 8000
 STOP_TIMEOUT_SECONDS = 10
+CAPTURE_HEARTBEAT_INTERVAL_SECONDS = 15
 MEETING_EXTRACTION_PROMPT_VERSION = "meeting-extractor-v1"
 MEETING_EXTRACTION_RUN_TYPE = "full_meeting_extraction"
 MEETING_EXTRACT_PROMPT = """You are extracting structured company memory from a meeting transcript.
@@ -107,8 +108,11 @@ class ActiveMeeting:
     state: MeetingState
     source_id: str | None = None
     meeting_id: str | None = None
+    capture_session_id: str | None = None
     task: asyncio.Task | None = None
     created_at: str = field(default_factory=now_iso)
+    last_capture_heartbeat_at: float = 0.0
+    capture_failure_recorded: bool = False
 
 
 @dataclass
@@ -388,7 +392,13 @@ class OrbitWhatsAppService:
 
             return {"status": "started", "meeting_code": meeting_code}
 
-    async def start_meeting_capture_session(self, meeting_id, meet_url, source_id=None):
+    async def start_meeting_capture_session(
+        self,
+        meeting_id,
+        meet_url,
+        source_id=None,
+        capture_session_id=None,
+    ):
         if not meeting_id:
             return {"status": "invalid_input"}
 
@@ -413,6 +423,7 @@ class OrbitWhatsAppService:
                 state=state,
                 meeting_id=meeting_id,
                 source_id=source_id,
+                capture_session_id=capture_session_id,
                 created_at=now_iso(),
             )
             # TODO: Replace this in-process task spawn with a durable queue/worker dispatch.
@@ -457,11 +468,135 @@ class OrbitWhatsAppService:
             on_orbit_mention=self.handle_orbit_mention,
             on_finished=self.handle_session_finished,
         )
+        await self._update_capture_session_status(active, "starting")
         try:
             await run_meeting_session(config, callbacks=callbacks, state=active.state)
+        except asyncio.CancelledError:
+            await self._mark_capture_session_failed(
+                active,
+                "CAPTURE_SESSION_CANCELLED",
+                "Meeting capture session was cancelled before cleanup completed.",
+            )
+            raise
+        except Exception:
+            await self._mark_capture_session_failed(
+                active,
+                "CAPTURE_SESSION_FAILED",
+                "Meeting capture session failed unexpectedly.",
+            )
+            raise
         finally:
             async with self.lock:
                 self.active_sessions.pop(active.session_id, None)
+
+    async def _update_capture_session_status(self, active, status, metadata=None):
+        if not active or not active.capture_session_id:
+            return None
+        if active.capture_failure_recorded:
+            return None
+        store = getattr(self, "meeting_store", None)
+        update_status = getattr(store, "update_capture_session_status", None)
+        if not callable(update_status):
+            return None
+        try:
+            return await update_status(active.capture_session_id, status, metadata=metadata)
+        except Exception as error:
+            log(
+                f"Failed to update capture session {active.capture_session_id} to {status}: {error}",
+                active.session_id,
+                level="error",
+            )
+            return None
+
+    async def _mark_capture_session_failed(self, active, error_code, error_message, metadata=None):
+        if not active or not active.capture_session_id:
+            return None
+        if active.capture_failure_recorded:
+            return None
+        active.capture_failure_recorded = True
+        store = getattr(self, "meeting_store", None)
+        mark_failed = getattr(store, "mark_capture_session_failed", None)
+        if not callable(mark_failed):
+            return None
+        try:
+            return await mark_failed(
+                active.capture_session_id,
+                error_code,
+                error_message,
+                metadata=metadata,
+            )
+        except Exception as error:
+            log(
+                f"Failed to mark capture session {active.capture_session_id} as failed: {error}",
+                active.session_id,
+                level="error",
+            )
+            return None
+
+    async def _mark_capture_session_finished(self, active):
+        if not active or not active.capture_session_id:
+            return None
+        if active.capture_failure_recorded:
+            return None
+        store = getattr(self, "meeting_store", None)
+        mark_finished = getattr(store, "mark_capture_session_finished", None)
+        if not callable(mark_finished):
+            return None
+        try:
+            return await mark_finished(active.capture_session_id)
+        except Exception as error:
+            log(
+                f"Failed to mark capture session {active.capture_session_id} as processed: {error}",
+                active.session_id,
+                level="error",
+            )
+            return None
+
+    async def _heartbeat_capture_session(self, active):
+        if not active or not active.capture_session_id:
+            return
+        now = asyncio.get_running_loop().time()
+        if (
+            active.last_capture_heartbeat_at
+            and now - active.last_capture_heartbeat_at < CAPTURE_HEARTBEAT_INTERVAL_SECONDS
+        ):
+            return
+        store = getattr(self, "meeting_store", None)
+        heartbeat = getattr(store, "heartbeat_capture_session", None)
+        if not callable(heartbeat):
+            return
+        try:
+            await heartbeat(active.capture_session_id)
+            active.last_capture_heartbeat_at = now
+        except Exception as error:
+            log(
+                f"Failed to heartbeat capture session {active.capture_session_id}: {error}",
+                active.session_id,
+                level="error",
+            )
+
+    async def _update_capture_session_for_meeting_status(self, state, status):
+        active = self.active_sessions.get(state.session_id)
+        if not active:
+            return
+
+        if status in {"starting_join", "waiting_for_host"}:
+            await self._update_capture_session_status(active, "joining")
+            return
+        if status == "joined":
+            await self._update_capture_session_status(active, "live")
+            return
+
+        failure_details = {
+            "join_denied": ("JOIN_DENIED", "Google Meet denied Orbit's join request."),
+            "join_blocked": ("JOIN_BLOCKED", "Google Meet blocked Orbit from joining."),
+            "join_unconfirmed": ("JOIN_UNCONFIRMED", "Orbit could not confirm whether it joined Google Meet."),
+            "no_active_page": ("NO_ACTIVE_PAGE", "Orbit lost the active browser page during capture."),
+            "error": ("CAPTURE_SESSION_ERROR", "Meeting capture failed during the browser session."),
+        }
+        failure = failure_details.get(status)
+        if failure:
+            await self._mark_capture_session_failed(active, failure[0], failure[1])
 
     def build_session_id(self, meeting_code):
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
@@ -715,6 +850,7 @@ class OrbitWhatsAppService:
         return start or end or ""
 
     async def handle_session_status(self, state, status, detail):
+        await self._update_capture_session_for_meeting_status(state, status)
         await self._update_persistent_meeting_status(state, status)
 
         if status == "starting_join":
@@ -1148,7 +1284,22 @@ class OrbitWhatsAppService:
         }
 
     async def handle_session_finished(self, state):
-        await self.live_stt.stop(state.session_id)
+        active = self.active_sessions.get(state.session_id)
+        try:
+            await self.live_stt.stop(state.session_id)
+        except Exception as error:
+            await self._mark_capture_session_failed(
+                active,
+                "LIVE_STT_STOP_FAILED",
+                "Live transcription cleanup failed.",
+            )
+            log(f"Live STT cleanup failed for Meet {state.meeting_code}: {error}", state.session_id, level="error")
+        if not state.joined_at:
+            await self._mark_capture_session_failed(
+                active,
+                "CAPTURE_NOT_ADMITTED",
+                "Meeting capture ended before Orbit was admitted to Google Meet.",
+            )
         await self._finalize_persistent_meeting(state)
         try:
             await self.memory.finalize_meeting(state)
@@ -1185,7 +1336,15 @@ class OrbitWhatsAppService:
         ended_at = state.finished_at or now_iso()
         final_summary_short = summary_short
         final_summary_long = summary_long
+        track_capture_finalization = bool(
+            active.capture_session_id
+            and state.joined_at
+            and not state.last_error
+            and not active.capture_failure_recorded
+        )
         try:
+            if track_capture_finalization:
+                await self._update_capture_session_status(active, "processing")
             await store.update_meeting_status(
                 active.meeting_id,
                 "processing",
@@ -1216,6 +1375,12 @@ class OrbitWhatsAppService:
                     final_summary_long = extracted_summary_long.strip()
 
             if extraction.get("status") == "failed":
+                if track_capture_finalization:
+                    await self._mark_capture_session_failed(
+                        active,
+                        "MEETING_EXTRACTION_FAILED",
+                        "Meeting capture extraction failed.",
+                    )
                 await store.update_meeting_status(
                     active.meeting_id,
                     "failed",
@@ -1247,11 +1412,19 @@ class OrbitWhatsAppService:
                 summary_long=final_summary_long,
                 overwrite_summary=True,
             )
+            if track_capture_finalization:
+                await self._mark_capture_session_finished(active)
         except Exception as error:
             log(
                 f"Failed to mark meeting as processed for {active.meeting_id}: {error}",
                 state.session_id,
             )
+            if track_capture_finalization:
+                await self._mark_capture_session_failed(
+                    active,
+                    "CAPTURE_FINALIZATION_FAILED",
+                    "Meeting capture finalization failed.",
+                )
             try:
                 await store.update_meeting_status(
                     active.meeting_id,
@@ -1496,6 +1669,10 @@ class OrbitWhatsAppService:
                             f"Orbit confirmed live audio transcription for Meet "
                             f"{active.state.meeting_code}."
                         )
+                        await self._update_capture_session_status(active, "streaming_audio")
+                        active.last_capture_heartbeat_at = asyncio.get_running_loop().time()
+                    else:
+                        await self._heartbeat_capture_session(active)
                     continue
 
                 raw_text = message.get("text")
@@ -1514,10 +1691,27 @@ class OrbitWhatsAppService:
                 elif message_type == "stop":
                     break
         except Exception as error:
+            await self._mark_capture_session_failed(
+                active,
+                "AUDIO_STREAM_FAILED",
+                "Live audio streaming failed.",
+            )
             log(
                 f"Live audio WebSocket failed for Meet {active.state.meeting_code}: {error}",
                 session_id,
                 level="error",
             )
         finally:
-            await self.live_stt.stop(session_id)
+            try:
+                await self.live_stt.stop(session_id)
+            except Exception as error:
+                await self._mark_capture_session_failed(
+                    active,
+                    "AUDIO_STREAM_CLEANUP_FAILED",
+                    "Live audio streaming cleanup failed.",
+                )
+                log(
+                    f"Live audio WebSocket cleanup failed for Meet {active.state.meeting_code}: {error}",
+                    session_id,
+                    level="error",
+                )

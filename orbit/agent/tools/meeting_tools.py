@@ -51,12 +51,18 @@ async def get_meeting_capture_status(meeting_id: str) -> dict:
             code="MEETING_NOT_FOUND",
             message="Meeting not found.",
         )
+    capture_session = await store.get_latest_capture_session_for_meeting(meeting_id)
+    capture_started_at = capture_session.get("started_at") if capture_session else meeting.get("started_at")
+    capture_ended_at = capture_session.get("ended_at") if capture_session else meeting.get("ended_at")
     return {
         "meeting_id": meeting["id"],
         "status": meeting["status"],
-        "started_at": _to_iso_string(meeting.get("started_at")),
-        "ended_at": _to_iso_string(meeting.get("ended_at")),
-        "error": None,
+        "meeting_status": meeting["status"],
+        "capture_status": capture_session.get("status") if capture_session else None,
+        "started_at": _to_iso_string(capture_started_at),
+        "ended_at": _to_iso_string(capture_ended_at),
+        "last_heartbeat_at": _to_iso_string(capture_session.get("last_heartbeat_at")) if capture_session else None,
+        "error": capture_session.get("error_message") if capture_session else None,
     }
 
 
@@ -112,8 +118,22 @@ async def request_meeting_capture(gmeet_url: str, requested_by_person_id: str) -
             message="Failed to create meeting record for the request.",
         )
 
+    capture_session = await store.create_capture_session(
+        meeting_id,
+        source_id,
+        capture_strategy="chrome_extension",
+        stt_provider="deepgram",
+    )
+    capture_session_id = capture_session.get("id") if capture_session else None
+    if not capture_session_id:
+        raise ConfigurationError(
+            code="MEETING_CAPTURE_CREATE_FAILED",
+            message="Failed to create capture session record for the request.",
+        )
+
     log(
-        f"Created meeting capture: meeting_id={meeting_id}, source_id={source_id}, requested_by_person_id={requested_by_person_id}",
+        f"Created meeting capture: meeting_id={meeting_id}, source_id={source_id}, "
+        f"capture_session_id={capture_session_id}, requested_by_person_id={requested_by_person_id}",
         level="info",
     )
 
@@ -123,6 +143,7 @@ async def request_meeting_capture(gmeet_url: str, requested_by_person_id: str) -
             gmeet_url=gmeet_url,
             source_id=source_id,
             requested_by_person_id=requested_by_person_id,
+            capture_session_id=capture_session_id,
         )
     except Exception:
         try:
@@ -133,8 +154,22 @@ async def request_meeting_capture(gmeet_url: str, requested_by_person_id: str) -
                 level="error",
             )
 
+        try:
+            await store.mark_capture_session_failed(
+                capture_session_id,
+                "CAPTURE_DISPATCH_FAILED",
+                "Meeting capture was created but could not be scheduled.",
+            )
+        except Exception as error:
+            log(
+                f"Failed to mark capture session as failed after dispatch failure. "
+                f"capture_session_id={capture_session_id}: {error}",
+                level="error",
+            )
+
         log(
-            f"Failed to dispatch capture job. meeting_id={meeting_id}, source_id={source_id}, requested_by_person_id={requested_by_person_id}",
+            f"Failed to dispatch capture job. meeting_id={meeting_id}, source_id={source_id}, "
+            f"capture_session_id={capture_session_id}, requested_by_person_id={requested_by_person_id}",
             level="error",
         )
         raise ConfigurationError(
@@ -144,6 +179,7 @@ async def request_meeting_capture(gmeet_url: str, requested_by_person_id: str) -
 
     return {
         "meeting_id": meeting_id,
+        "capture_session_id": capture_session_id,
         "status": "created",
         "message": "Meeting capture created and scheduled.",
     }

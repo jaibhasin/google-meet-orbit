@@ -128,15 +128,95 @@ class MeetingStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS people", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS sources", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS meetings", MEETING_SCHEMA_SQL)
+        self.assertIn("CREATE TABLE IF NOT EXISTS capture_sessions", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS source_chunks", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS extraction_runs", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS decisions", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS action_items", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS memories", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE INDEX IF NOT EXISTS idx_source_chunks_source_id", MEETING_SCHEMA_SQL)
+        self.assertIn("CREATE INDEX IF NOT EXISTS idx_capture_sessions_meeting_id", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE INDEX IF NOT EXISTS idx_decisions_meeting_id", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE INDEX IF NOT EXISTS idx_action_items_meeting_id", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE INDEX IF NOT EXISTS idx_memories_meeting_id", MEETING_SCHEMA_SQL)
+
+    async def test_create_capture_session_inserts_scheduled_row(self):
+        row = {
+            "id": "capture-1",
+            "meeting_id": "meeting-1",
+            "source_id": "source-1",
+            "capture_strategy": "chrome_extension",
+            "stt_provider": "deepgram",
+            "status": "scheduled",
+        }
+        cursor = FakeCursor(fetchone_results=[row])
+        store = FakeMeetingStore([cursor])
+        store._ready = True
+
+        capture_session = await store.create_capture_session("meeting-1", "source-1")
+
+        self.assertEqual(capture_session, row)
+        self.assertIn("INSERT INTO capture_sessions", cursor.executions[0][0])
+        self.assertEqual(cursor.executions[0][1], ("meeting-1", "source-1", "chrome_extension", "deepgram"))
+
+    async def test_update_capture_session_streaming_audio_updates_heartbeat(self):
+        cursor = FakeCursor(fetchone_results=[{"id": "capture-1", "status": "streaming_audio"}])
+        store = FakeMeetingStore([cursor])
+        store._ready = True
+
+        capture_session = await store.update_capture_session_status(
+            "capture-1",
+            "streaming_audio",
+            metadata={"audio": "confirmed"},
+        )
+
+        self.assertEqual(capture_session["status"], "streaming_audio")
+        sql, params = cursor.executions[0]
+        self.assertIn("UPDATE capture_sessions SET", sql)
+        self.assertIn("last_heartbeat_at = now()", sql)
+        self.assertEqual(params[0], "streaming_audio")
+        self.assertEqual(params[-1], "capture-1")
+
+    async def test_heartbeat_capture_session_updates_timestamp(self):
+        cursor = FakeCursor()
+        store = FakeMeetingStore([cursor])
+        store._ready = True
+
+        await store.heartbeat_capture_session("capture-1")
+
+        sql, params = cursor.executions[0]
+        self.assertIn("SET last_heartbeat_at = now(), updated_at = now()", sql)
+        self.assertEqual(params, ("capture-1",))
+
+    async def test_mark_capture_session_failed_stores_safe_error(self):
+        cursor = FakeCursor(fetchone_results=[{"id": "capture-1", "status": "failed"}])
+        store = FakeMeetingStore([cursor])
+        store._ready = True
+
+        capture_session = await store.mark_capture_session_failed(
+            "capture-1",
+            "CAPTURE_DISPATCH_FAILED",
+            "Meeting capture was created but could not be scheduled.",
+        )
+
+        self.assertEqual(capture_session["status"], "failed")
+        sql, params = cursor.executions[0]
+        self.assertIn("status = 'failed'", sql)
+        self.assertEqual(params[0], "CAPTURE_DISPATCH_FAILED")
+        self.assertEqual(params[-1], "capture-1")
+
+    async def test_get_latest_capture_session_for_meeting_orders_newest_first(self):
+        cursor = FakeCursor(fetchone_results=[{"id": "capture-new", "status": "live"}])
+        store = FakeMeetingStore([cursor])
+        store._ready = True
+
+        capture_session = await store.get_latest_capture_session_for_meeting("meeting-1")
+
+        self.assertEqual(capture_session["id"], "capture-new")
+        sql, params = cursor.executions[0]
+        self.assertIn("ORDER BY created_at DESC", sql)
+        self.assertIn("LIMIT 1", sql)
+        self.assertEqual(params, ("meeting-1",))
 
     async def test_save_source_chunks_inserts_text_with_order_and_metadata(self):
         cursor = FakeCursor()

@@ -15,6 +15,7 @@ async def enqueue_meeting_capture(
     gmeet_url: str,
     source_id: str | None = None,
     requested_by_person_id: str | None = None,
+    capture_session_id: str | None = None,
 ) -> None:
     meeting_id = _require_uuid(
         meeting_id,
@@ -24,9 +25,17 @@ async def enqueue_meeting_capture(
     )
 
     gmeet_url = _require_google_meet_url(gmeet_url)
+    if capture_session_id is not None:
+        capture_session_id = _require_uuid(
+            capture_session_id,
+            field_name="capture_session_id",
+            error_code="INVALID_CAPTURE_SESSION_ID",
+            required_message="Capture session id must be a valid UUID.",
+        )
 
     log(
-        f"Dispatching capture scheduling: meeting_id={meeting_id}, source_id={source_id}, requested_by_person_id={requested_by_person_id}",
+        f"Dispatching capture scheduling: meeting_id={meeting_id}, source_id={source_id}, "
+        f"capture_session_id={capture_session_id}, requested_by_person_id={requested_by_person_id}",
         level="info",
     )
 
@@ -35,6 +44,7 @@ async def enqueue_meeting_capture(
         meeting_id=meeting_id,
         meet_url=gmeet_url,
         source_id=source_id,
+        capture_session_id=capture_session_id,
     )
 
     if result.get("status") != "started":

@@ -4,6 +4,7 @@ import asyncio
 import unittest
 import sys
 import types
+from unittest.mock import AsyncMock, patch
 
 
 if "twilio" not in sys.modules:
@@ -107,6 +108,10 @@ class FakeMeetingStore:
         self.memories = []
         self.source_chunks_for_id = {}
         self.meetings_lookup = {}
+        self.capture_session_updates = []
+        self.capture_session_heartbeats = []
+        self.failed_capture_sessions = []
+        self.finished_capture_sessions = []
 
     async def find_or_create_person_by_phone(self, phone, name=None):
         self.people.append((phone, name))
@@ -162,6 +167,41 @@ class FakeMeetingStore:
 
     async def update_meeting_status(self, meeting_id, status, **kwargs):
         self.updates.append({"meeting_id": meeting_id, "status": status, "fields": kwargs})
+
+    async def update_capture_session_status(self, capture_session_id, status, metadata=None):
+        self.capture_session_updates.append(
+            {
+                "capture_session_id": capture_session_id,
+                "status": status,
+                "metadata": metadata,
+            }
+        )
+        return self.capture_session_updates[-1]
+
+    async def heartbeat_capture_session(self, capture_session_id):
+        self.capture_session_heartbeats.append(capture_session_id)
+
+    async def mark_capture_session_failed(
+        self,
+        capture_session_id,
+        error_code,
+        error_message,
+        metadata=None,
+    ):
+        self.failed_capture_sessions.append(
+            {
+                "capture_session_id": capture_session_id,
+                "status": "failed",
+                "error_code": error_code,
+                "error_message": error_message,
+                "metadata": metadata,
+            }
+        )
+        return self.failed_capture_sessions[-1]
+
+    async def mark_capture_session_finished(self, capture_session_id):
+        self.finished_capture_sessions.append(capture_session_id)
+        return {"capture_session_id": capture_session_id, "status": "processed"}
 
     async def save_transcript_chunks(self, source_id, chunks):
         self.transcript_save_calls.append((source_id, chunks))
@@ -746,6 +786,40 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.updates[0]["status"], "joining")
         self.assertEqual(store.updates[1]["status"], "live")
 
+    async def test_capture_session_tracks_start_join_live_and_failure(self):
+        store = FakeMeetingStore()
+        service = build_service(meeting_store=store)
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        active = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            meeting_id="meeting-1",
+            capture_session_id="capture-1",
+        )
+        service.active_sessions[state.session_id] = active
+
+        with patch("orbit.whatsapp_service.run_meeting_session", new_callable=AsyncMock):
+            await service._run_session(active, object())
+
+        self.assertEqual(store.capture_session_updates[0]["status"], "starting")
+
+        service.active_sessions[state.session_id] = active
+        await service.handle_session_status(state, "starting_join", "opening")
+        await service.handle_session_status(state, "joined", "joined")
+        await service.handle_session_status(state, "join_denied", "denied")
+
+        self.assertEqual(
+            [update["status"] for update in store.capture_session_updates],
+            ["starting", "joining", "live"],
+        )
+        self.assertEqual(store.failed_capture_sessions[-1]["error_code"], "JOIN_DENIED")
+
     async def test_session_finished_marks_meeting_processed(self):
         store = FakeMeetingStore()
         store.source_chunks_for_id = {
@@ -788,6 +862,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             state=state,
             meeting_id="meeting-1",
             source_id="source-1",
+            capture_session_id="capture-1",
         )
         service.live_stt = FakeLiveSTT()
 
@@ -801,6 +876,8 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.updates[0]["status"], "processing")
         self.assertEqual(store.updates[-1]["status"], "processed")
         self.assertEqual(store.extraction_runs[-1]["status"], "success")
+        self.assertEqual(store.capture_session_updates[-1]["status"], "processing")
+        self.assertEqual(store.finished_capture_sessions, ["capture-1"])
         fields = store.updates[-1]["fields"]
         self.assertEqual(fields["ended_at"], "2026-05-31T11:00:00")
         self.assertEqual(fields["started_at"], "2026-05-31T10:00:00")
@@ -1366,6 +1443,34 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_finished_unadmitted_meeting_marks_capture_session_failed(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+            status="waiting_for_host",
+        )
+        service.active_sessions[state.session_id] = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            capture_session_id="capture-1",
+        )
+
+        async def fake_send_whatsapp_message(body):
+            return None
+
+        service.send_whatsapp_message = fake_send_whatsapp_message
+
+        await service.handle_session_finished(state)
+
+        self.assertEqual(
+            service.meeting_store.failed_capture_sessions[-1]["error_code"],
+            "CAPTURE_NOT_ADMITTED",
+        )
+
     async def test_finished_meeting_reports_leave_reason(self):
         service = build_service()
         whatsapp_updates = []
@@ -1442,6 +1547,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             session_id=state.session_id,
             meet_url=state.meet_url,
             state=state,
+            capture_session_id="capture-1",
         )
         websocket = FakeWebSocket(
             [
@@ -1467,6 +1573,10 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             whatsapp_updates,
             ["Orbit confirmed live audio transcription for Meet abc-defg-hij."],
+        )
+        self.assertEqual(
+            service.meeting_store.capture_session_updates[-1]["status"],
+            "streaming_audio",
         )
 
     async def test_extension_audio_stream_is_not_confirmed_before_first_chunk(self):
@@ -1496,6 +1606,33 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             state.live_stt_status_detail,
             "Extension audio WebSocket connected. Waiting for the first audio chunk.",
+        )
+
+    async def test_extension_audio_stream_failure_marks_capture_session_failed(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        service.active_sessions[state.session_id] = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            capture_session_id="capture-1",
+        )
+        websocket = FakeWebSocket(
+            [
+                {"text": '{"type":"start","encoding":"linear16","sample_rate":16000,"channels":1}'},
+            ]
+        )
+
+        await service.handle_audio_stream(websocket, state.session_id)
+
+        self.assertEqual(
+            service.meeting_store.failed_capture_sessions[-1]["error_code"],
+            "AUDIO_STREAM_FAILED",
         )
 
     async def test_extension_empty_audio_chunk_does_not_confirm_live_stt(self):

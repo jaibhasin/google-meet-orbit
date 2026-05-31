@@ -117,7 +117,15 @@ class FakeCaptureStore:
     def __init__(self):
         self.create_source_calls = []
         self.create_meeting_calls = []
-        self.calls = {"create_source": 0, "create_meeting": 0}
+        self.capture_sessions = []
+        self.failed_capture_sessions = []
+        self.calls = {
+            "create_source": 0,
+            "create_meeting": 0,
+            "create_capture_session": 0,
+            "get_latest_capture_session_for_meeting": 0,
+            "mark_capture_session_failed": 0,
+        }
 
     async def create_source(self, source_type, *, url=None, **kwargs):
         self.calls["create_source"] += 1
@@ -144,6 +152,52 @@ class FakeCaptureStore:
             }
         )
         return "meeting-1"
+
+    async def create_capture_session(
+        self,
+        meeting_id,
+        source_id,
+        capture_strategy="chrome_extension",
+        stt_provider="deepgram",
+    ):
+        self.calls["create_capture_session"] += 1
+        capture_session = {
+            "id": "capture-session-1",
+            "meeting_id": meeting_id,
+            "source_id": source_id,
+            "capture_strategy": capture_strategy,
+            "stt_provider": stt_provider,
+            "status": "scheduled",
+        }
+        self.capture_sessions.append(capture_session)
+        return capture_session
+
+    async def get_latest_capture_session_for_meeting(self, meeting_id):
+        self.calls["get_latest_capture_session_for_meeting"] += 1
+        matches = [
+            capture_session
+            for capture_session in self.capture_sessions
+            if capture_session["meeting_id"] == meeting_id
+        ]
+        return matches[-1] if matches else None
+
+    async def mark_capture_session_failed(
+        self,
+        capture_session_id,
+        error_code,
+        error_message,
+        metadata=None,
+    ):
+        self.calls["mark_capture_session_failed"] += 1
+        failure = {
+            "id": capture_session_id,
+            "status": "failed",
+            "error_code": error_code,
+            "error_message": error_message,
+            "metadata": metadata,
+        }
+        self.failed_capture_sessions.append(failure)
+        return failure
 
 
 class AgentToolsImportTests(unittest.TestCase):
@@ -290,9 +344,42 @@ class MeetingCaptureStatusToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["meeting_id"], VALID_MEETING_ID)
         self.assertEqual(payload["status"], "created")
+        self.assertEqual(payload["meeting_status"], "created")
+        self.assertIsNone(payload["capture_status"])
         self.assertIsNone(payload["started_at"])
         self.assertIsNone(payload["ended_at"])
+        self.assertIsNone(payload["last_heartbeat_at"])
         self.assertIsNone(payload["error"])
+
+    async def test_get_meeting_capture_status_includes_latest_capture_session(self):
+        meeting = build_meeting_payload(VALID_MEETING_ID, status="live")
+        store = FakeCaptureStore()
+        store.capture_sessions.append(
+            {
+                "id": "capture-session-1",
+                "meeting_id": VALID_MEETING_ID,
+                "status": "streaming_audio",
+                "started_at": "2026-05-31T10:01:00+00:00",
+                "ended_at": None,
+                "last_heartbeat_at": "2026-05-31T10:02:00+00:00",
+                "error_message": None,
+            }
+        )
+
+        async def get_meeting_by_id(meeting_id: str):
+            return meeting if meeting_id == VALID_MEETING_ID else None
+
+        store.get_meeting_by_id = get_meeting_by_id
+
+        with patch("orbit.agent.tools.meeting_tools._require_database_url", return_value="postgresql://example"):
+            with patch("orbit.agent.tools.meeting_tools.build_meeting_store", return_value=store):
+                payload = await get_meeting_capture_status(VALID_MEETING_ID)
+
+        self.assertEqual(payload["status"], "live")
+        self.assertEqual(payload["meeting_status"], "live")
+        self.assertEqual(payload["capture_status"], "streaming_audio")
+        self.assertEqual(payload["started_at"], "2026-05-31T10:01:00+00:00")
+        self.assertEqual(payload["last_heartbeat_at"], "2026-05-31T10:02:00+00:00")
 
     async def test_get_meeting_capture_status_returns_processed_payload(self):
         meeting = build_meeting_payload(VALID_MEETING_ID, status="processed")
@@ -329,14 +416,20 @@ class RequestMeetingCaptureToolTests(unittest.IsolatedAsyncioTestCase):
             gmeet_url="https://meet.google.com/abc-defg-hij",
             source_id="source-1",
             requested_by_person_id=VALID_PERSON_ID,
+            capture_session_id="capture-session-1",
         )
 
         self.assertEqual(result["meeting_id"], "meeting-1")
+        self.assertEqual(result["capture_session_id"], "capture-session-1")
         self.assertEqual(result["status"], "created")
         self.assertEqual(result["message"], "Meeting capture created and scheduled.")
 
         self.assertEqual(store.calls["create_source"], 1)
         self.assertEqual(store.calls["create_meeting"], 1)
+        self.assertEqual(store.calls["create_capture_session"], 1)
+        self.assertEqual(store.capture_sessions[0]["status"], "scheduled")
+        self.assertEqual(store.capture_sessions[0]["capture_strategy"], "chrome_extension")
+        self.assertEqual(store.capture_sessions[0]["stt_provider"], "deepgram")
         self.assertEqual(store.create_source_calls[0][0], "gmeet")
         self.assertEqual(store.create_source_calls[0][1], "https://meet.google.com/abc-defg-hij")
         self.assertEqual(store.create_meeting_calls[0]["gmeet_url"], "https://meet.google.com/abc-defg-hij")
@@ -369,6 +462,9 @@ class RequestMeetingCaptureToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exc_info.exception.code, "MEETING_CAPTURE_DISPATCH_FAILED")
         self.assertEqual(len(status_updates), 1)
         self.assertEqual(status_updates[0][1], "failed")
+        self.assertEqual(store.calls["mark_capture_session_failed"], 1)
+        self.assertEqual(store.failed_capture_sessions[0]["status"], "failed")
+        self.assertEqual(store.failed_capture_sessions[0]["error_code"], "CAPTURE_DISPATCH_FAILED")
 
 
 class ToolInputValidationTests(unittest.IsolatedAsyncioTestCase):

@@ -133,6 +133,7 @@ async def handle_whatsapp_command(from_number: str, body: str) -> str:
             reply = _safe_response_text(
                 [
                     f"Meeting status: {payload.get('status')}",
+                    f"Capture status: {_format_unknown(payload.get('capture_status'))}",
                     f"Started: {_format_unknown(payload.get('started_at'))}",
                     f"Ended: {_format_unknown(payload.get('ended_at'))}",
                 ]

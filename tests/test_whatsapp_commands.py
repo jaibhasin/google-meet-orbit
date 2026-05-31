@@ -125,8 +125,12 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
                 return_value={
                     "meeting_id": VALID_MEETING_ID,
                     "status": "processed",
+                    "meeting_status": "processed",
+                    "capture_status": "streaming_audio",
                     "started_at": None,
                     "ended_at": "2026-05-31T11:00:00+00:00",
+                    "last_heartbeat_at": "2026-05-31T10:59:00+00:00",
+                    "error": None,
                 },
             ):
                 reply = await handle_whatsapp_command(
@@ -135,8 +139,33 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertIn("Meeting status: processed", reply)
+        self.assertIn("Capture status: streaming_audio", reply)
         self.assertIn("Started: unknown", reply)
         self.assertIn("Ended: 2026-05-31T11:00:00+00:00", reply)
+
+    async def test_status_formats_unknown_capture_status(self):
+        with patch("orbit.agent.whatsapp.command_handler.resolve_person_id_by_whatsapp_phone", return_value=VALID_PERSON_ID):
+            with patch(
+                "orbit.agent.whatsapp.command_handler.get_meeting_capture_status",
+                new_callable=AsyncMock,
+                return_value={
+                    "meeting_id": VALID_MEETING_ID,
+                    "status": "created",
+                    "meeting_status": "created",
+                    "capture_status": None,
+                    "started_at": None,
+                    "ended_at": None,
+                    "last_heartbeat_at": None,
+                    "error": None,
+                },
+            ):
+                reply = await handle_whatsapp_command(
+                    "whatsapp:+15551230000",
+                    f"status {VALID_MEETING_ID}",
+                )
+
+        self.assertIn("Meeting status: created", reply)
+        self.assertIn("Capture status: unknown", reply)
 
     async def test_summary_when_ready_includes_counts(self):
         with patch("orbit.agent.whatsapp.command_handler.resolve_person_id_by_whatsapp_phone", return_value=VALID_PERSON_ID):

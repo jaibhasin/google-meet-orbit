@@ -6,6 +6,18 @@ from dataclasses import dataclass
 from orbit.phone_numbers import normalize_whatsapp_phone
 
 
+CAPTURE_SESSION_STATUSES = {
+    "scheduled",
+    "starting",
+    "joining",
+    "live",
+    "streaming_audio",
+    "processing",
+    "processed",
+    "failed",
+}
+
+
 MEETING_SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -40,6 +52,36 @@ CREATE TABLE IF NOT EXISTS meetings (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS capture_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    source_id UUID REFERENCES sources(id) ON DELETE SET NULL,
+    capture_strategy TEXT NOT NULL DEFAULT 'chrome_extension',
+    stt_provider TEXT DEFAULT 'deepgram',
+    status TEXT NOT NULL DEFAULT 'scheduled'
+        CHECK (status IN (
+            'scheduled',
+            'starting',
+            'joining',
+            'live',
+            'streaming_audio',
+            'processing',
+            'processed',
+            'failed'
+        )),
+    started_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ,
+    last_heartbeat_at TIMESTAMPTZ,
+    error_code TEXT,
+    error_message TEXT,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_capture_sessions_meeting_id
+    ON capture_sessions(meeting_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS source_chunks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -160,6 +202,41 @@ class DisabledMeetingStore:
         summary_long: str | None = None,
         overwrite_summary: bool = False,
     ) -> None:
+        return None
+
+    async def create_capture_session(
+        self,
+        meeting_id: str,
+        source_id: str | None,
+        capture_strategy: str = "chrome_extension",
+        stt_provider: str | None = "deepgram",
+    ) -> dict | None:
+        return None
+
+    async def update_capture_session_status(
+        self,
+        capture_session_id: str,
+        status: str,
+        metadata: dict | None = None,
+    ) -> dict | None:
+        return None
+
+    async def heartbeat_capture_session(self, capture_session_id: str) -> None:
+        return None
+
+    async def mark_capture_session_failed(
+        self,
+        capture_session_id: str,
+        error_code: str,
+        error_message: str,
+        metadata: dict | None = None,
+    ) -> dict | None:
+        return None
+
+    async def mark_capture_session_finished(self, capture_session_id: str) -> dict | None:
+        return None
+
+    async def get_latest_capture_session_for_meeting(self, meeting_id: str) -> dict | None:
         return None
 
     async def save_transcript_chunks(self, source_id: str, chunks: list[dict]) -> int:
@@ -602,6 +679,216 @@ class PostgresMeetingStore:
             async with conn.cursor() as cursor:
                 await cursor.execute(sql, values)
                 await conn.commit()
+
+    async def create_capture_session(
+        self,
+        meeting_id: str,
+        source_id: str | None,
+        capture_strategy: str = "chrome_extension",
+        stt_provider: str | None = "deepgram",
+    ) -> dict | None:
+        if not meeting_id:
+            return None
+
+        capture_strategy = self._coerce_optional_str(capture_strategy) or "chrome_extension"
+        stt_provider = self._coerce_optional_str(stt_provider)
+
+        await self._ensure_ready()
+        async with await self._connect() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO capture_sessions (
+                        meeting_id,
+                        source_id,
+                        capture_strategy,
+                        stt_provider,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, 'scheduled')
+                    RETURNING
+                        id,
+                        meeting_id,
+                        source_id,
+                        capture_strategy,
+                        stt_provider,
+                        status,
+                        started_at,
+                        ended_at,
+                        last_heartbeat_at,
+                        error_code,
+                        error_message,
+                        metadata,
+                        created_at,
+                        updated_at
+                    """,
+                    (
+                        meeting_id,
+                        source_id,
+                        capture_strategy,
+                        stt_provider,
+                    ),
+                )
+                row = await cursor.fetchone()
+                await conn.commit()
+                return row
+
+    async def update_capture_session_status(
+        self,
+        capture_session_id: str,
+        status: str,
+        metadata: dict | None = None,
+    ) -> dict | None:
+        if not capture_session_id:
+            return None
+
+        status = self._validate_capture_session_status(status)
+        updates = [
+            "status = %s",
+            "metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb)",
+            "updated_at = now()",
+        ]
+        values = [status, json.dumps(metadata) if metadata is not None else None]
+        if status == "starting":
+            updates.append("started_at = COALESCE(started_at, now())")
+        if status == "streaming_audio":
+            updates.append("last_heartbeat_at = now()")
+        if status in {"processed", "failed"}:
+            updates.append("ended_at = COALESCE(ended_at, now())")
+
+        values.append(capture_session_id)
+        sql = f"""
+            UPDATE capture_sessions
+            SET {", ".join(updates)}
+            WHERE id = %s
+            RETURNING
+                id,
+                meeting_id,
+                source_id,
+                capture_strategy,
+                stt_provider,
+                status,
+                started_at,
+                ended_at,
+                last_heartbeat_at,
+                error_code,
+                error_message,
+                metadata,
+                created_at,
+                updated_at
+        """
+
+        await self._ensure_ready()
+        async with await self._connect() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(sql, values)
+                row = await cursor.fetchone()
+                await conn.commit()
+                return row
+
+    async def heartbeat_capture_session(self, capture_session_id: str) -> None:
+        if not capture_session_id:
+            return
+
+        await self._ensure_ready()
+        async with await self._connect() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE capture_sessions
+                    SET last_heartbeat_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (capture_session_id,),
+                )
+                await conn.commit()
+
+    async def mark_capture_session_failed(
+        self,
+        capture_session_id: str,
+        error_code: str,
+        error_message: str,
+        metadata: dict | None = None,
+    ) -> dict | None:
+        if not capture_session_id:
+            return None
+
+        await self._ensure_ready()
+        async with await self._connect() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE capture_sessions
+                    SET
+                        status = 'failed',
+                        ended_at = COALESCE(ended_at, now()),
+                        error_code = %s,
+                        error_message = %s,
+                        metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb),
+                        updated_at = now()
+                    WHERE id = %s
+                    RETURNING
+                        id,
+                        meeting_id,
+                        source_id,
+                        capture_strategy,
+                        stt_provider,
+                        status,
+                        started_at,
+                        ended_at,
+                        last_heartbeat_at,
+                        error_code,
+                        error_message,
+                        metadata,
+                        created_at,
+                        updated_at
+                    """,
+                    (
+                        self._coerce_optional_str(error_code) or "CAPTURE_FAILED",
+                        self._coerce_optional_str(error_message) or "Meeting capture failed.",
+                        json.dumps(metadata) if metadata is not None else None,
+                        capture_session_id,
+                    ),
+                )
+                row = await cursor.fetchone()
+                await conn.commit()
+                return row
+
+    async def mark_capture_session_finished(self, capture_session_id: str) -> dict | None:
+        return await self.update_capture_session_status(capture_session_id, "processed")
+
+    async def get_latest_capture_session_for_meeting(self, meeting_id: str) -> dict | None:
+        if not meeting_id:
+            return None
+
+        await self._ensure_ready()
+        async with await self._connect() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        meeting_id,
+                        source_id,
+                        capture_strategy,
+                        stt_provider,
+                        status,
+                        started_at,
+                        ended_at,
+                        last_heartbeat_at,
+                        error_code,
+                        error_message,
+                        metadata,
+                        created_at,
+                        updated_at
+                    FROM capture_sessions
+                    WHERE meeting_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (meeting_id,),
+                )
+                return await cursor.fetchone()
 
     async def save_transcript_chunks(self, source_id: str, chunks: list[dict]) -> int:
         if not source_id:
@@ -1313,6 +1600,13 @@ class PostgresMeetingStore:
             if text:
                 return text
         return None
+
+    @staticmethod
+    def _validate_capture_session_status(status: str) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized not in CAPTURE_SESSION_STATUSES:
+            raise ValueError(f"Unsupported capture session status: {status}")
+        return normalized
 
     def _normalize_decision(self, decision):
         if not isinstance(decision, dict):
