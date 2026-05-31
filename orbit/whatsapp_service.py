@@ -22,7 +22,11 @@ from orbit.meet_types import (
     MeetingState,
     build_meeting_state,
 )
-from orbit.meeting_store import build_meeting_store
+from orbit.meeting_store import (
+    build_meeting_store,
+    default_capture_session_metadata,
+    merge_capture_session_metadata,
+)
 from orbit.phone_numbers import normalize_whatsapp_phone
 from orbit.memory import MemoryAnswer, MemorySource, build_memory_service
 from orbit.live_stt import LiveAudioFormat, LiveSTTManager
@@ -67,6 +71,8 @@ LIVE_RECAP_MAX_SEGMENTS = 40
 LIVE_RECALL_MAX_PROMPT_CHARS = 8000
 STOP_TIMEOUT_SECONDS = 10
 CAPTURE_HEARTBEAT_INTERVAL_SECONDS = 15
+CAPTURE_AUDIO_METADATA_FLUSH_CHUNKS = 25
+CAPTURE_AUDIO_METADATA_FLUSH_INTERVAL_SECONDS = 5
 MEETING_EXTRACTION_PROMPT_VERSION = "meeting-extractor-v1"
 MEETING_EXTRACTION_RUN_TYPE = "full_meeting_extraction"
 MEETING_EXTRACT_PROMPT = """You are extracting structured company memory from a meeting transcript.
@@ -113,6 +119,9 @@ class ActiveMeeting:
     created_at: str = field(default_factory=now_iso)
     last_capture_heartbeat_at: float = 0.0
     capture_failure_recorded: bool = False
+    capture_health_metadata: dict = field(default_factory=default_capture_session_metadata)
+    audio_chunks_since_metadata_flush: int = 0
+    last_capture_metadata_flush_at: float = 0.0
 
 
 @dataclass
@@ -181,6 +190,7 @@ class OrbitWhatsAppService:
             memory=self.memory,
             api_key=self._read_env("DEEPGRAM_API_KEY"),
             model=self._read_env("DEEPGRAM_LIVE_MODEL", "nova-3"),
+            health_event_handler=self._handle_live_stt_health_event,
         )
         self.active_sessions: dict[str, ActiveMeeting] = {}
         # TODO: make dialogue history durable before running multiple workers or relying on restart continuity.
@@ -494,6 +504,11 @@ class OrbitWhatsAppService:
             return None
         if active.capture_failure_recorded:
             return None
+        if metadata:
+            active.capture_health_metadata = merge_capture_session_metadata(
+                active.capture_health_metadata,
+                metadata,
+            )
         store = getattr(self, "meeting_store", None)
         update_status = getattr(store, "update_capture_session_status", None)
         if not callable(update_status):
@@ -514,6 +529,11 @@ class OrbitWhatsAppService:
         if active.capture_failure_recorded:
             return None
         active.capture_failure_recorded = True
+        if metadata:
+            active.capture_health_metadata = merge_capture_session_metadata(
+                active.capture_health_metadata,
+                metadata,
+            )
         store = getattr(self, "meeting_store", None)
         mark_failed = getattr(store, "mark_capture_session_failed", None)
         if not callable(mark_failed):
@@ -528,6 +548,29 @@ class OrbitWhatsAppService:
         except Exception as error:
             log(
                 f"Failed to mark capture session {active.capture_session_id} as failed: {error}",
+                active.session_id,
+                level="error",
+            )
+            return None
+
+    async def _update_capture_session_metadata(self, active, patch):
+        if not active or not isinstance(patch, dict):
+            return None
+        active.capture_health_metadata = merge_capture_session_metadata(
+            active.capture_health_metadata,
+            patch,
+        )
+        if not active.capture_session_id:
+            return None
+        store = getattr(self, "meeting_store", None)
+        update_metadata = getattr(store, "update_capture_session_metadata", None)
+        if not callable(update_metadata):
+            return None
+        try:
+            return await update_metadata(active.capture_session_id, patch)
+        except Exception as error:
+            log(
+                f"Failed to update capture session metadata {active.capture_session_id}: {error}",
                 active.session_id,
                 level="error",
             )
@@ -574,6 +617,106 @@ class OrbitWhatsAppService:
                 active.session_id,
                 level="error",
             )
+
+    async def _handle_live_stt_health_event(self, state, event, details):
+        active = self.active_sessions.get(state.session_id)
+        if not active:
+            return
+
+        timestamp = now_iso()
+        deepgram = active.capture_health_metadata["deepgram"]
+        patch = {"deepgram": {}}
+        update = patch["deepgram"]
+        failure = None
+
+        if event == "connect_started":
+            update["connect_started_at"] = timestamp
+        elif event == "connected":
+            update["connected_at"] = timestamp
+        elif event == "connection_closed":
+            update.update(
+                {
+                    "connection_closed_at": timestamp,
+                    "close_code": details.get("close_code"),
+                    "close_reason": self._safe_capture_error(details.get("close_reason")),
+                }
+            )
+        elif event == "connect_failed":
+            update["error"] = self._safe_capture_error(details.get("error"))
+            failure = ("DEEPGRAM_CONNECT_FAILED", "Deepgram live transcription could not connect.")
+        elif event in {"stream_closed", "stream_error"}:
+            update.update(
+                {
+                    "connection_closed_at": timestamp,
+                    "close_code": details.get("close_code"),
+                    "close_reason": self._safe_capture_error(details.get("close_reason")),
+                    "error": self._safe_capture_error(details.get("error")),
+                }
+            )
+            failure = ("DEEPGRAM_STREAM_CLOSED", "Deepgram live transcription closed unexpectedly.")
+        elif event == "transcript":
+            update["last_transcript_at"] = timestamp
+            if not deepgram.get("first_transcript_at"):
+                update["first_transcript_at"] = timestamp
+            counter = "final_transcript_count" if details.get("is_final") else "interim_transcript_count"
+            update[counter] = int(deepgram.get(counter) or 0) + 1
+        else:
+            return
+
+        if failure:
+            await self._mark_capture_session_failed(active, failure[0], failure[1], metadata=patch)
+            return
+        await self._update_capture_session_metadata(active, patch)
+
+    @staticmethod
+    def _safe_capture_error(value):
+        text = str(value or "").strip()
+        return text[:500] or None
+
+    @staticmethod
+    def _audio_health(active):
+        return active.capture_health_metadata["audio"]
+
+    def _record_audio_chunk_received(self, active, chunk_size):
+        audio = self._audio_health(active)
+        timestamp = now_iso()
+        if not audio.get("first_chunk_at"):
+            audio["first_chunk_at"] = timestamp
+        audio["last_chunk_at"] = timestamp
+        audio["chunk_count"] = int(audio.get("chunk_count") or 0) + 1
+        audio["bytes_received"] = int(audio.get("bytes_received") or 0) + chunk_size
+        audio["last_chunk_size_bytes"] = chunk_size
+        audio["streaming_started"] = True
+        active.audio_chunks_since_metadata_flush += 1
+
+    def _record_audio_chunk_forwarded(self, active, chunk_size):
+        audio = self._audio_health(active)
+        audio["bytes_forwarded_to_stt"] = int(audio.get("bytes_forwarded_to_stt") or 0) + chunk_size
+
+    def _record_empty_audio_chunk(self, active):
+        audio = self._audio_health(active)
+        audio["silent_or_empty_chunk_count"] = int(audio.get("silent_or_empty_chunk_count") or 0) + 1
+        active.audio_chunks_since_metadata_flush += 1
+
+    async def _flush_capture_audio_health(self, active, *, force=False):
+        if not active or not active.audio_chunks_since_metadata_flush:
+            return
+        now = asyncio.get_running_loop().time()
+        if (
+            not force
+            and active.audio_chunks_since_metadata_flush < CAPTURE_AUDIO_METADATA_FLUSH_CHUNKS
+            and (
+                active.last_capture_metadata_flush_at
+                and now - active.last_capture_metadata_flush_at < CAPTURE_AUDIO_METADATA_FLUSH_INTERVAL_SECONDS
+            )
+        ):
+            return
+        await self._update_capture_session_metadata(
+            active,
+            {"audio": dict(self._audio_health(active))},
+        )
+        active.audio_chunks_since_metadata_flush = 0
+        active.last_capture_metadata_flush_at = now
 
     async def _update_capture_session_for_meeting_status(self, state, status):
         active = self.active_sessions.get(state.session_id)
@@ -1294,6 +1437,12 @@ class OrbitWhatsAppService:
                 "Live transcription cleanup failed.",
             )
             log(f"Live STT cleanup failed for Meet {state.meeting_code}: {error}", state.session_id, level="error")
+        if state.joined_at and state.live_stt_requested and not state.live_stt_started:
+            await self._mark_capture_session_failed(
+                active,
+                "AUDIO_STREAM_NOT_STARTED",
+                "Live audio streaming did not start before the meeting capture ended.",
+            )
         if not state.joined_at:
             await self._mark_capture_session_failed(
                 active,
@@ -1654,11 +1803,16 @@ class OrbitWhatsAppService:
             while True:
                 message = await websocket.receive()
                 if message.get("bytes") is not None:
-                    if not message["bytes"]:
+                    chunk = message["bytes"]
+                    if not chunk:
+                        self._record_empty_audio_chunk(active)
+                        await self._flush_capture_audio_health(active)
                         continue
+                    self._record_audio_chunk_received(active, len(chunk))
                     if session is None:
                         session = await self.live_stt.get_or_create(active.state)
-                    await session.send_audio(message["bytes"])
+                    await session.send_audio(chunk)
+                    self._record_audio_chunk_forwarded(active, len(chunk))
                     if not active.state.live_stt_started:
                         active.state.live_stt_started = True
                         active.state.live_stt_audio_confirmed_at = now_iso()
@@ -1669,9 +1823,16 @@ class OrbitWhatsAppService:
                             f"Orbit confirmed live audio transcription for Meet "
                             f"{active.state.meeting_code}."
                         )
-                        await self._update_capture_session_status(active, "streaming_audio")
+                        await self._update_capture_session_status(
+                            active,
+                            "streaming_audio",
+                            metadata={"audio": dict(self._audio_health(active))},
+                        )
+                        active.audio_chunks_since_metadata_flush = 0
+                        active.last_capture_metadata_flush_at = asyncio.get_running_loop().time()
                         active.last_capture_heartbeat_at = asyncio.get_running_loop().time()
                     else:
+                        await self._flush_capture_audio_health(active)
                         await self._heartbeat_capture_session(active)
                     continue
 
@@ -1691,10 +1852,12 @@ class OrbitWhatsAppService:
                 elif message_type == "stop":
                     break
         except Exception as error:
+            await self._flush_capture_audio_health(active, force=True)
             await self._mark_capture_session_failed(
                 active,
-                "AUDIO_STREAM_FAILED",
-                "Live audio streaming failed.",
+                "AUDIO_WEBSOCKET_CLOSED",
+                "Live audio WebSocket closed unexpectedly.",
+                metadata={"audio": dict(self._audio_health(active))},
             )
             log(
                 f"Live audio WebSocket failed for Meet {active.state.meeting_code}: {error}",
@@ -1702,6 +1865,7 @@ class OrbitWhatsAppService:
                 level="error",
             )
         finally:
+            await self._flush_capture_audio_health(active, force=True)
             try:
                 await self.live_stt.stop(session_id)
             except Exception as error:

@@ -197,6 +197,33 @@ class LiveSTTTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.audio_chunks, [b"pcm"])
         self.assertEqual(session.audio_chunks_received, 1)
 
+    async def test_health_callback_tracks_connection_and_transcript_type_without_text(self):
+        events = []
+
+        async def record_health(state, event, details):
+            events.append((event, details))
+
+        fake = FakeTranscriber()
+        session = LiveSTTSession(
+            state=build_state(),
+            memory=FakeMemory(),
+            api_key="dg-key",
+            model="nova-3",
+            transcriber_factory=lambda audio_format: fake,
+            health_event_handler=record_health,
+        )
+
+        await session.send_audio(b"pcm")
+        await session.process_deepgram_message(final_deepgram_message("sensitive transcript"))
+        await session.close()
+
+        self.assertEqual(events[0][0], "connect_started")
+        self.assertEqual(events[1][0], "connected")
+        transcript_event = next(details for event, details in events if event == "transcript")
+        self.assertEqual(transcript_event, {"is_final": True})
+        self.assertNotIn("sensitive transcript", str(events))
+        self.assertEqual(events[-1][0], "connection_closed")
+
     async def test_deepgram_auth_failure_surfaces(self):
         fake = FakeTranscriber(connect_error=RuntimeError("auth failed"))
         session = LiveSTTSession(

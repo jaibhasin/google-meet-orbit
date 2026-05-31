@@ -83,6 +83,18 @@ def _format_summary_text(summary_text: str | None) -> str:
     return summary_text.strip() if (summary_text or "").strip() else "No summary available."
 
 
+def _format_audio_health(audio_health: dict | None) -> str:
+    return "receiving" if (audio_health or {}).get("streaming_started") else "not started"
+
+
+def _format_stt_health(stt_health: dict | None) -> str:
+    health = stt_health or {}
+    if not health.get("connected_at"):
+        return "not connected"
+    state = "closed" if health.get("connection_closed_at") else "connected"
+    return f"{state}, {int(health.get('final_transcript_count') or 0)} final segments"
+
+
 def _safe_response_text(lines: list[str]) -> str:
     return "\n".join(line for line in lines if line is not None)
 
@@ -134,6 +146,8 @@ async def handle_whatsapp_command(from_number: str, body: str) -> str:
                 [
                     f"Meeting status: {payload.get('status')}",
                     f"Capture status: {_format_unknown(payload.get('capture_status'))}",
+                    f"Audio: {_format_audio_health(payload.get('audio_health'))}",
+                    f"STT: {_format_stt_health(payload.get('stt_health'))}",
                     f"Started: {_format_unknown(payload.get('started_at'))}",
                     f"Ended: {_format_unknown(payload.get('ended_at'))}",
                 ]

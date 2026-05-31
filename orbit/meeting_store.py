@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 
 from orbit.phone_numbers import normalize_whatsapp_phone
@@ -18,8 +19,84 @@ CAPTURE_SESSION_STATUSES = {
 }
 
 
+def default_capture_session_metadata() -> dict:
+    return {
+        "audio": {
+            "first_chunk_at": None,
+            "last_chunk_at": None,
+            "chunk_count": 0,
+            "bytes_received": 0,
+            "bytes_forwarded_to_stt": 0,
+            "last_chunk_size_bytes": 0,
+            "silent_or_empty_chunk_count": 0,
+            "streaming_started": False,
+        },
+        "deepgram": {
+            "connect_started_at": None,
+            "connected_at": None,
+            "connection_closed_at": None,
+            "close_code": None,
+            "close_reason": None,
+            "error": None,
+            "keepalive_count": 0,
+            "last_keepalive_at": None,
+            "reconnect_count": 0,
+            "first_transcript_at": None,
+            "last_transcript_at": None,
+            "final_transcript_count": 0,
+            "interim_transcript_count": 0,
+        },
+    }
+
+
+def merge_capture_session_metadata(current: dict | None, patch: dict | None) -> dict:
+    merged = deepcopy(current) if isinstance(current, dict) else {}
+    if not isinstance(patch, dict):
+        return merged
+
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_capture_session_metadata(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
 MEETING_SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE OR REPLACE FUNCTION orbit_jsonb_deep_merge(original JSONB, patch JSONB)
+RETURNS JSONB
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    result JSONB := COALESCE(original, '{}'::jsonb);
+    entry RECORD;
+BEGIN
+    IF jsonb_typeof(result) <> 'object' OR jsonb_typeof(COALESCE(patch, '{}'::jsonb)) <> 'object' THEN
+        RETURN COALESCE(patch, result);
+    END IF;
+
+    FOR entry IN SELECT key, value FROM jsonb_each(COALESCE(patch, '{}'::jsonb))
+    LOOP
+        IF result ? entry.key
+           AND jsonb_typeof(result -> entry.key) = 'object'
+           AND jsonb_typeof(entry.value) = 'object' THEN
+            result := jsonb_set(
+                result,
+                ARRAY[entry.key],
+                orbit_jsonb_deep_merge(result -> entry.key, entry.value),
+                true
+            );
+        ELSE
+            result := jsonb_set(result, ARRAY[entry.key], entry.value, true);
+        END IF;
+    END LOOP;
+
+    RETURN result;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS people (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -218,6 +295,14 @@ class DisabledMeetingStore:
         capture_session_id: str,
         status: str,
         metadata: dict | None = None,
+    ) -> dict | None:
+        return None
+
+    async def update_capture_session_metadata(
+        self,
+        capture_session_id: str,
+        patch: dict,
+        merge: bool = True,
     ) -> dict | None:
         return None
 
@@ -703,9 +788,10 @@ class PostgresMeetingStore:
                         source_id,
                         capture_strategy,
                         stt_provider,
-                        status
+                        status,
+                        metadata
                     )
-                    VALUES (%s, %s, %s, %s, 'scheduled')
+                    VALUES (%s, %s, %s, %s, 'scheduled', %s::jsonb)
                     RETURNING
                         id,
                         meeting_id,
@@ -727,6 +813,7 @@ class PostgresMeetingStore:
                         source_id,
                         capture_strategy,
                         stt_provider,
+                        json.dumps(default_capture_session_metadata()),
                     ),
                 )
                 row = await cursor.fetchone()
@@ -745,7 +832,7 @@ class PostgresMeetingStore:
         status = self._validate_capture_session_status(status)
         updates = [
             "status = %s",
-            "metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb)",
+            "metadata = orbit_jsonb_deep_merge(metadata, COALESCE(%s::jsonb, '{}'::jsonb))",
             "updated_at = now()",
         ]
         values = [status, json.dumps(metadata) if metadata is not None else None]
@@ -782,6 +869,59 @@ class PostgresMeetingStore:
         async with await self._connect() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(sql, values)
+                row = await cursor.fetchone()
+                await conn.commit()
+                return row
+
+    async def update_capture_session_metadata(
+        self,
+        capture_session_id: str,
+        patch: dict,
+        merge: bool = True,
+    ) -> dict | None:
+        if not capture_session_id:
+            return None
+        if not isinstance(patch, dict):
+            raise ValueError("Capture session metadata patch must be a dictionary.")
+
+        metadata_expression = (
+            "orbit_jsonb_deep_merge(metadata, %s::jsonb)"
+            if merge
+            else "%s::jsonb"
+        )
+        sql = f"""
+            UPDATE capture_sessions
+            SET
+                metadata = {metadata_expression},
+                updated_at = now()
+            WHERE id = %s
+            RETURNING
+                id,
+                meeting_id,
+                source_id,
+                capture_strategy,
+                stt_provider,
+                status,
+                started_at,
+                ended_at,
+                last_heartbeat_at,
+                error_code,
+                error_message,
+                metadata,
+                created_at,
+                updated_at
+        """
+
+        await self._ensure_ready()
+        async with await self._connect() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    sql,
+                    (
+                        json.dumps(patch),
+                        capture_session_id,
+                    ),
+                )
                 row = await cursor.fetchone()
                 await conn.commit()
                 return row
@@ -824,7 +964,7 @@ class PostgresMeetingStore:
                         ended_at = COALESCE(ended_at, now()),
                         error_code = %s,
                         error_message = %s,
-                        metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb),
+                        metadata = orbit_jsonb_deep_merge(metadata, COALESCE(%s::jsonb, '{}'::jsonb)),
                         updated_at = now()
                     WHERE id = %s
                     RETURNING

@@ -131,6 +131,11 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
                     "ended_at": "2026-05-31T11:00:00+00:00",
                     "last_heartbeat_at": "2026-05-31T10:59:00+00:00",
                     "error": None,
+                    "audio_health": {"streaming_started": True},
+                    "stt_health": {
+                        "connected_at": "2026-05-31T10:01:00+00:00",
+                        "final_transcript_count": 4,
+                    },
                 },
             ):
                 reply = await handle_whatsapp_command(
@@ -140,6 +145,8 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Meeting status: processed", reply)
         self.assertIn("Capture status: streaming_audio", reply)
+        self.assertIn("Audio: receiving", reply)
+        self.assertIn("STT: connected, 4 final segments", reply)
         self.assertIn("Started: unknown", reply)
         self.assertIn("Ended: 2026-05-31T11:00:00+00:00", reply)
 
@@ -166,6 +173,8 @@ class WhatsAppCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Meeting status: created", reply)
         self.assertIn("Capture status: unknown", reply)
+        self.assertIn("Audio: not started", reply)
+        self.assertIn("STT: not connected", reply)
 
     async def test_summary_when_ready_includes_counts(self):
         with patch("orbit.agent.whatsapp.command_handler.resolve_person_id_by_whatsapp_phone", return_value=VALID_PERSON_ID):

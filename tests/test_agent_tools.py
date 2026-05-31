@@ -350,6 +350,8 @@ class MeetingCaptureStatusToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(payload["ended_at"])
         self.assertIsNone(payload["last_heartbeat_at"])
         self.assertIsNone(payload["error"])
+        self.assertFalse(payload["audio_health"]["streaming_started"])
+        self.assertIsNone(payload["stt_health"]["provider"])
 
     async def test_get_meeting_capture_status_includes_latest_capture_session(self):
         meeting = build_meeting_payload(VALID_MEETING_ID, status="live")
@@ -363,6 +365,23 @@ class MeetingCaptureStatusToolTests(unittest.IsolatedAsyncioTestCase):
                 "ended_at": None,
                 "last_heartbeat_at": "2026-05-31T10:02:00+00:00",
                 "error_message": None,
+                "stt_provider": "deepgram",
+                "metadata": {
+                    "audio": {
+                        "streaming_started": True,
+                        "first_chunk_at": "2026-05-31T10:01:30+00:00",
+                        "last_chunk_at": "2026-05-31T10:02:00+00:00",
+                        "chunk_count": 7,
+                        "bytes_received": 700,
+                        "bytes_forwarded_to_stt": 700,
+                    },
+                    "deepgram": {
+                        "connected_at": "2026-05-31T10:01:30+00:00",
+                        "last_transcript_at": "2026-05-31T10:01:59+00:00",
+                        "final_transcript_count": 2,
+                        "interim_transcript_count": 0,
+                    },
+                },
             }
         )
 
@@ -380,6 +399,11 @@ class MeetingCaptureStatusToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["capture_status"], "streaming_audio")
         self.assertEqual(payload["started_at"], "2026-05-31T10:01:00+00:00")
         self.assertEqual(payload["last_heartbeat_at"], "2026-05-31T10:02:00+00:00")
+        self.assertTrue(payload["audio_health"]["streaming_started"])
+        self.assertEqual(payload["audio_health"]["chunk_count"], 7)
+        self.assertEqual(payload["audio_health"]["bytes_forwarded_to_stt"], 700)
+        self.assertEqual(payload["stt_health"]["provider"], "deepgram")
+        self.assertEqual(payload["stt_health"]["final_transcript_count"], 2)
 
     async def test_get_meeting_capture_status_returns_processed_payload(self):
         meeting = build_meeting_payload(VALID_MEETING_ID, status="processed")

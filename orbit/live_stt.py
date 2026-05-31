@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 
 from orbit.caption_attribution import CaptionSnippet, merge_caption_speakers
@@ -45,6 +46,7 @@ class LiveSTTSession:
         model: str,
         audio_format: LiveAudioFormat | None = None,
         transcriber_factory=None,
+        health_event_handler=None,
     ):
         self.state = state
         self.memory = memory
@@ -52,6 +54,7 @@ class LiveSTTSession:
         self.model = model
         self.audio_format = audio_format or LiveAudioFormat()
         self.transcriber_factory = transcriber_factory or self._default_transcriber_factory
+        self.health_event_handler = health_event_handler
         self.transcriber = None
         self.receive_task: asyncio.Task | None = None
         self.captions: list[CaptionSnippet] = []
@@ -69,7 +72,13 @@ class LiveSTTSession:
 
         self.transcriber = self.transcriber_factory(self.audio_format)
         assert self.transcriber is not None
-        await self.transcriber.connect()
+        await self._emit_health_event("connect_started")
+        try:
+            await self.transcriber.connect()
+        except Exception as error:
+            await self._emit_health_event("connect_failed", error=str(error))
+            raise
+        await self._emit_health_event("connected")
         self.receive_task = asyncio.create_task(self._receive_loop())
         log("Live STT Deepgram stream started.", self.state.session_id, level="important")
 
@@ -91,6 +100,10 @@ class LiveSTTSession:
         self.captions = self.captions[-100:]
 
     async def process_deepgram_message(self, message: str | bytes) -> None:
+        transcript_result = _deepgram_transcript_result(message)
+        if transcript_result is not None:
+            await self._emit_health_event("transcript", is_final=transcript_result["is_final"])
+
         raw_segments = parse_deepgram_message(
             message,
             source_id_prefix=f"{self.state.session_id}-live",
@@ -174,7 +187,10 @@ class LiveSTTSession:
                         await asyncio.wait_for(self.receive_task, timeout=self._finalize_timeout_s)
                     except asyncio.TimeoutError:
                         pass
-            await self.transcriber.close()
+            try:
+                await self.transcriber.close()
+            finally:
+                await self._emit_health_event("connection_closed", **self._transcriber_close_details())
         await self._flush_pending_segments()
         if self.receive_task is not None:
             self.receive_task.cancel()
@@ -197,11 +213,42 @@ class LiveSTTSession:
             assert self.transcriber is not None
             async for message in self.transcriber.receive():
                 await self.process_deepgram_message(message)
+            if not self.closed:
+                self.last_error = "Deepgram stream closed before meeting capture cleanup."
+                await self._emit_health_event(
+                    "stream_closed",
+                    error=self.last_error,
+                    **self._transcriber_close_details(),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as error:
             self.last_error = str(error)
+            await self._emit_health_event("stream_error", error=self.last_error)
             log(f"Live STT receive loop failed: {error}", self.state.session_id, level="error")
+
+    async def _emit_health_event(self, event: str, **details) -> None:
+        if not callable(self.health_event_handler):
+            return
+        try:
+            await self.health_event_handler(self.state, event, details)
+        except Exception as error:
+            log(
+                f"Live STT health tracking failed for {event}: {error}",
+                self.state.session_id,
+                level="error",
+            )
+
+    def _transcriber_close_details(self) -> dict:
+        if self.transcriber is None:
+            return {}
+        close_details = getattr(self.transcriber, "close_details", None)
+        if callable(close_details):
+            return close_details()
+        return {
+            "close_code": getattr(self.transcriber, "close_code", None),
+            "close_reason": getattr(self.transcriber, "close_reason", None),
+        }
 
     def _default_transcriber_factory(self, audio_format: LiveAudioFormat):
         return DeepgramLiveTranscriber(
@@ -236,11 +283,13 @@ class LiveSTTManager:
         api_key: str | None,
         model: str = "nova-3",
         transcriber_factory=None,
+        health_event_handler=None,
     ):
         self.memory = memory
         self.api_key = api_key
         self.model = model
         self.transcriber_factory = transcriber_factory
+        self.health_event_handler = health_event_handler
         self.sessions: dict[str, LiveSTTSession] = {}
         self.pending_captions: dict[str, list[CaptionSnippet]] = {}
         self.lock = asyncio.Lock()
@@ -267,6 +316,7 @@ class LiveSTTManager:
                     model=self.model,
                     audio_format=audio_format,
                     transcriber_factory=self.transcriber_factory,
+                    health_event_handler=self.health_event_handler,
                 )
                 pending_captions = self.pending_captions.pop(state.session_id, [])
                 session.add_captions(pending_captions)
@@ -289,3 +339,22 @@ class LiveSTTManager:
             self.pending_captions.pop(session_id, None)
         if session is not None:
             await session.close()
+
+
+def _deepgram_transcript_result(message: str | bytes) -> dict | None:
+    if isinstance(message, bytes):
+        try:
+            message = message.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    try:
+        payload = json.loads(message)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if payload.get("type") != "Results":
+        return None
+    alternatives = (payload.get("channel") or {}).get("alternatives") or []
+    transcript = str((alternatives[0] or {}).get("transcript") or "").strip() if alternatives else ""
+    if not transcript:
+        return None
+    return {"is_final": payload.get("is_final") is True}

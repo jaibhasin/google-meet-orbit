@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
 import unittest
 
-from orbit.meeting_store import MEETING_SCHEMA_SQL, DisabledMeetingStore, PostgresMeetingStore
+from orbit.meeting_store import (
+    MEETING_SCHEMA_SQL,
+    DisabledMeetingStore,
+    PostgresMeetingStore,
+    merge_capture_session_metadata,
+)
 
 
 class FakeCursor:
@@ -129,6 +135,7 @@ class MeetingStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS sources", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS meetings", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS capture_sessions", MEETING_SCHEMA_SQL)
+        self.assertIn("CREATE OR REPLACE FUNCTION orbit_jsonb_deep_merge", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS source_chunks", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS extraction_runs", MEETING_SCHEMA_SQL)
         self.assertIn("CREATE TABLE IF NOT EXISTS decisions", MEETING_SCHEMA_SQL)
@@ -157,7 +164,39 @@ class MeetingStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(capture_session, row)
         self.assertIn("INSERT INTO capture_sessions", cursor.executions[0][0])
-        self.assertEqual(cursor.executions[0][1], ("meeting-1", "source-1", "chrome_extension", "deepgram"))
+        params = cursor.executions[0][1]
+        self.assertEqual(params[:4], ("meeting-1", "source-1", "chrome_extension", "deepgram"))
+        metadata = json.loads(params[4])
+        self.assertFalse(metadata["audio"]["streaming_started"])
+        self.assertEqual(metadata["deepgram"]["final_transcript_count"], 0)
+
+    async def test_capture_session_metadata_merge_preserves_nested_keys(self):
+        merged = merge_capture_session_metadata(
+            {
+                "audio": {"chunk_count": 2, "bytes_received": 10},
+                "deepgram": {"connected_at": "earlier"},
+            },
+            {"audio": {"chunk_count": 3}},
+        )
+
+        self.assertEqual(merged["audio"]["chunk_count"], 3)
+        self.assertEqual(merged["audio"]["bytes_received"], 10)
+        self.assertEqual(merged["deepgram"]["connected_at"], "earlier")
+
+    async def test_update_capture_session_metadata_uses_recursive_merge(self):
+        cursor = FakeCursor(fetchone_results=[{"id": "capture-1"}])
+        store = FakeMeetingStore([cursor])
+        store._ready = True
+
+        await store.update_capture_session_metadata(
+            "capture-1",
+            {"audio": {"chunk_count": 3}},
+        )
+
+        sql, params = cursor.executions[0]
+        self.assertIn("metadata = orbit_jsonb_deep_merge(metadata, %s::jsonb)", sql)
+        self.assertEqual(json.loads(params[0]), {"audio": {"chunk_count": 3}})
+        self.assertEqual(params[-1], "capture-1")
 
     async def test_update_capture_session_streaming_audio_updates_heartbeat(self):
         cursor = FakeCursor(fetchone_results=[{"id": "capture-1", "status": "streaming_audio"}])

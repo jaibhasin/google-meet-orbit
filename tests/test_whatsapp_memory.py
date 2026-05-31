@@ -37,9 +37,14 @@ if "twilio" not in sys.modules:
     sys.modules["twilio.twiml.messaging_response"] = twilio_messaging_module
 
 from orbit.meet_types import ChatMessage, MeetingState
+from orbit.meeting_store import merge_capture_session_metadata
 from orbit.memory import MemoryAnswer, MemorySource
 from orbit.transcript import TranscriptSegment
-from orbit.whatsapp_service import ActiveMeeting, OrbitWhatsAppService
+from orbit.whatsapp_service import (
+    CAPTURE_AUDIO_METADATA_FLUSH_CHUNKS,
+    ActiveMeeting,
+    OrbitWhatsAppService,
+)
 
 
 class FakeMemory:
@@ -109,6 +114,8 @@ class FakeMeetingStore:
         self.source_chunks_for_id = {}
         self.meetings_lookup = {}
         self.capture_session_updates = []
+        self.capture_session_metadata_updates = []
+        self.capture_session_metadata = {}
         self.capture_session_heartbeats = []
         self.failed_capture_sessions = []
         self.finished_capture_sessions = []
@@ -180,6 +187,23 @@ class FakeMeetingStore:
 
     async def heartbeat_capture_session(self, capture_session_id):
         self.capture_session_heartbeats.append(capture_session_id)
+
+    async def update_capture_session_metadata(self, capture_session_id, patch, merge=True):
+        self.capture_session_metadata_updates.append(
+            {
+                "capture_session_id": capture_session_id,
+                "patch": patch,
+                "merge": merge,
+            }
+        )
+        self.capture_session_metadata = merge_capture_session_metadata(
+            self.capture_session_metadata if merge else {},
+            patch,
+        )
+        return {
+            "capture_session_id": capture_session_id,
+            "metadata": self.capture_session_metadata,
+        }
 
     async def mark_capture_session_failed(
         self,
@@ -845,6 +869,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             display_name="Orbit",
             joined_at="2026-05-31T10:00:00",
             live_stt_requested=True,
+            live_stt_started=True,
             finished_at="2026-05-31T11:00:00",
         )
         state.captured_messages = [
@@ -1443,6 +1468,34 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_finished_meeting_marks_missing_live_audio_failed(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+            joined_at="2026-05-30T09:34:16Z",
+            live_stt_requested=True,
+        )
+        service.active_sessions[state.session_id] = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            capture_session_id="capture-1",
+        )
+
+        async def fake_send_whatsapp_message(body):
+            return None
+
+        service.send_whatsapp_message = fake_send_whatsapp_message
+        await service.handle_session_finished(state)
+
+        self.assertEqual(
+            service.meeting_store.failed_capture_sessions[-1]["error_code"],
+            "AUDIO_STREAM_NOT_STARTED",
+        )
+
     async def test_finished_unadmitted_meeting_marks_capture_session_failed(self):
         service = build_service()
         state = MeetingState(
@@ -1553,6 +1606,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             [
                 {"text": '{"type":"start","encoding":"linear16","sample_rate":16000,"channels":1}'},
                 {"bytes": b"pcm"},
+                {"bytes": b"more"},
                 {"text": '{"type":"stop"}'},
             ]
         )
@@ -1562,7 +1616,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(websocket.accepted)
         self.assertEqual(websocket.sent_json, [{"type": "ready"}])
         fake_session = service.live_stt.sessions[0][2]
-        self.assertEqual(fake_session.audio_chunks, [b"pcm"])
+        self.assertEqual(fake_session.audio_chunks, [b"pcm", b"more"])
         self.assertEqual(service.live_stt.stopped, [state.session_id])
         self.assertTrue(state.live_stt_started)
         self.assertIsNotNone(state.live_stt_audio_confirmed_at)
@@ -1578,6 +1632,108 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             service.meeting_store.capture_session_updates[-1]["status"],
             "streaming_audio",
         )
+        audio = service.active_sessions[state.session_id].capture_health_metadata["audio"]
+        self.assertTrue(audio["streaming_started"])
+        self.assertIsNotNone(audio["first_chunk_at"])
+        self.assertEqual(audio["chunk_count"], 2)
+        self.assertEqual(audio["bytes_received"], 7)
+        self.assertEqual(audio["bytes_forwarded_to_stt"], 7)
+        self.assertTrue(service.meeting_store.capture_session_metadata_updates)
+
+    async def test_deepgram_health_tracks_connection_and_transcripts_without_text(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        active = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            capture_session_id="capture-1",
+        )
+        service.active_sessions[state.session_id] = active
+
+        await service._handle_live_stt_health_event(state, "connect_started", {})
+        await service._handle_live_stt_health_event(state, "connected", {})
+        await service._handle_live_stt_health_event(
+            state,
+            "transcript",
+            {"is_final": False, "transcript": "must not be stored"},
+        )
+        await service._handle_live_stt_health_event(
+            state,
+            "transcript",
+            {"is_final": True, "transcript": "must not be stored"},
+        )
+
+        deepgram = active.capture_health_metadata["deepgram"]
+        self.assertIsNotNone(deepgram["connect_started_at"])
+        self.assertIsNotNone(deepgram["connected_at"])
+        self.assertIsNotNone(deepgram["first_transcript_at"])
+        self.assertEqual(deepgram["final_transcript_count"], 1)
+        self.assertEqual(deepgram["interim_transcript_count"], 1)
+        self.assertNotIn("must not be stored", str(service.meeting_store.capture_session_metadata))
+
+    async def test_audio_metadata_writes_are_throttled(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        active = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            capture_session_id="capture-1",
+            last_capture_metadata_flush_at=asyncio.get_running_loop().time(),
+        )
+
+        for _ in range(CAPTURE_AUDIO_METADATA_FLUSH_CHUNKS - 1):
+            service._record_audio_chunk_received(active, 3)
+            service._record_audio_chunk_forwarded(active, 3)
+            await service._flush_capture_audio_health(active)
+
+        self.assertEqual(service.meeting_store.capture_session_metadata_updates, [])
+
+        service._record_audio_chunk_received(active, 3)
+        service._record_audio_chunk_forwarded(active, 3)
+        await service._flush_capture_audio_health(active)
+
+        self.assertEqual(len(service.meeting_store.capture_session_metadata_updates), 1)
+        self.assertEqual(
+            service.meeting_store.capture_session_metadata["audio"]["chunk_count"],
+            CAPTURE_AUDIO_METADATA_FLUSH_CHUNKS,
+        )
+
+    async def test_deepgram_connect_failure_is_classified(self):
+        service = build_service()
+        state = MeetingState(
+            session_id="session-1",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        service.active_sessions[state.session_id] = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            capture_session_id="capture-1",
+        )
+
+        await service._handle_live_stt_health_event(
+            state,
+            "connect_failed",
+            {"error": "provider unavailable"},
+        )
+
+        failure = service.meeting_store.failed_capture_sessions[-1]
+        self.assertEqual(failure["error_code"], "DEEPGRAM_CONNECT_FAILED")
+        self.assertEqual(failure["metadata"]["deepgram"]["error"], "provider unavailable")
 
     async def test_extension_audio_stream_is_not_confirmed_before_first_chunk(self):
         service = build_service()
@@ -1632,7 +1788,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             service.meeting_store.failed_capture_sessions[-1]["error_code"],
-            "AUDIO_STREAM_FAILED",
+            "AUDIO_WEBSOCKET_CLOSED",
         )
 
     async def test_extension_empty_audio_chunk_does_not_confirm_live_stt(self):
@@ -1647,6 +1803,7 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             session_id=state.session_id,
             meet_url=state.meet_url,
             state=state,
+            capture_session_id="capture-1",
         )
         websocket = FakeWebSocket(
             [
@@ -1661,6 +1818,11 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.live_stt_started)
         fake_session = service.live_stt.sessions[0][2]
         self.assertEqual(fake_session.audio_chunks, [])
+        self.assertEqual(
+            service.active_sessions[state.session_id]
+            .capture_health_metadata["audio"]["silent_or_empty_chunk_count"],
+            1,
+        )
 
     async def test_extension_missing_unknown_session_closes_websocket(self):
         service = build_service()

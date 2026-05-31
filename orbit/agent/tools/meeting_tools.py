@@ -18,7 +18,12 @@ from orbit.meeting_intelligence_service import (
     MeetingIntelligenceService,
     MeetingNotFoundError,
 )
-from orbit.meeting_store import DisabledMeetingStore, build_meeting_store
+from orbit.meeting_store import (
+    DisabledMeetingStore,
+    build_meeting_store,
+    default_capture_session_metadata,
+    merge_capture_session_metadata,
+)
 
 
 async def get_meeting_intelligence(meeting_id: str) -> dict:
@@ -54,6 +59,12 @@ async def get_meeting_capture_status(meeting_id: str) -> dict:
     capture_session = await store.get_latest_capture_session_for_meeting(meeting_id)
     capture_started_at = capture_session.get("started_at") if capture_session else meeting.get("started_at")
     capture_ended_at = capture_session.get("ended_at") if capture_session else meeting.get("ended_at")
+    capture_metadata = merge_capture_session_metadata(
+        default_capture_session_metadata(),
+        capture_session.get("metadata") if capture_session else None,
+    )
+    audio = capture_metadata["audio"]
+    deepgram = capture_metadata["deepgram"]
     return {
         "meeting_id": meeting["id"],
         "status": meeting["status"],
@@ -63,6 +74,23 @@ async def get_meeting_capture_status(meeting_id: str) -> dict:
         "ended_at": _to_iso_string(capture_ended_at),
         "last_heartbeat_at": _to_iso_string(capture_session.get("last_heartbeat_at")) if capture_session else None,
         "error": capture_session.get("error_message") if capture_session else None,
+        "audio_health": {
+            "streaming_started": bool(audio.get("streaming_started")),
+            "first_chunk_at": _to_iso_string(audio.get("first_chunk_at")),
+            "last_chunk_at": _to_iso_string(audio.get("last_chunk_at")),
+            "chunk_count": int(audio.get("chunk_count") or 0),
+            "bytes_received": int(audio.get("bytes_received") or 0),
+            "bytes_forwarded_to_stt": int(audio.get("bytes_forwarded_to_stt") or 0),
+        },
+        "stt_health": {
+            "provider": capture_session.get("stt_provider") if capture_session else None,
+            "connected_at": _to_iso_string(deepgram.get("connected_at")),
+            "connection_closed_at": _to_iso_string(deepgram.get("connection_closed_at")),
+            "last_transcript_at": _to_iso_string(deepgram.get("last_transcript_at")),
+            "final_transcript_count": int(deepgram.get("final_transcript_count") or 0),
+            "interim_transcript_count": int(deepgram.get("interim_transcript_count") or 0),
+            "last_keepalive_at": _to_iso_string(deepgram.get("last_keepalive_at")),
+        },
     }
 
 

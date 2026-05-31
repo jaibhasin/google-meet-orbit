@@ -121,6 +121,8 @@ class DeepgramLiveTranscriber:
         self._connect = connect
         self._ws = None
         self._finish_sent = False
+        self.close_code = None
+        self.close_reason = None
 
     async def connect(self):
         if self._ws is not None:
@@ -142,6 +144,10 @@ class DeepgramLiveTranscriber:
                 deepgram_live_url(self.config),
                 extra_headers={"Authorization": f"Token {self.api_key}"},
             )
+        # TODO: Add reconnect handling if live transcription should survive a
+        # provider-side disconnect without restarting extension capture.
+        # TODO: Add Deepgram KeepAlive messages if the audio transport gains
+        # meaningful idle periods. Current extension capture continuously sends audio.
         return self
 
     async def send_audio(self, audio_chunk: bytes) -> None:
@@ -174,9 +180,27 @@ class DeepgramLiveTranscriber:
             await self.finish()
         except Exception:
             pass
-        await self._ws.close()
+        websocket = self._ws
+        await websocket.close()
+        self.close_code = getattr(websocket, "close_code", getattr(websocket, "code", None))
+        self.close_reason = getattr(websocket, "close_reason", getattr(websocket, "reason", None))
         self._ws = None
         self._finish_sent = False
+
+    def close_details(self) -> dict:
+        websocket = self._ws
+        return {
+            "close_code": (
+                getattr(websocket, "close_code", getattr(websocket, "code", None))
+                if websocket is not None
+                else self.close_code
+            ),
+            "close_reason": (
+                getattr(websocket, "close_reason", getattr(websocket, "reason", None))
+                if websocket is not None
+                else self.close_reason
+            ),
+        }
 
 
 def _first_numeric(*values) -> float | None:
