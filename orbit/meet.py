@@ -75,15 +75,17 @@ This automation is only allowed to join meetings I already have permission to jo
 
 Steps:
 1. Stay on the Google Meet page for this URL.
-2. If a modal asks whether people should see or hear you, click "Continue without microphone and camera". If that exact button is not available, choose the option that keeps microphone and camera disabled.
-3. If a visible guest name field exists, fill it with "{display_name}".
-4. If microphone or camera toggles are on in the pre-join screen, turn them off.
-5. Click the best available join button, preferring "Ask to join", then "Join now", then "Request to join", then "Join".
-6. Treat the guest pre-join area as the source of truth. If the page shows a name input and a join button, continue the guest join flow even if a top-right "Sign in" link, tooltip, or helper bubble is also visible.
-7. Do not treat a generic top-right "Sign in" link or tooltip as a blocking condition by itself. Only treat sign-in as blocking if the main page content explicitly says sign-in is required or the meeting cannot be joined without it.
-8. If the page says host approval is required, the request was denied, or the meeting cannot be joined, stop and report the exact visible reason.
-9. After clicking the join button, remain on the meeting page and do not navigate away.
-10. Finish only after you have either joined successfully or clearly determined that Google Meet blocked entry.
+2. Join with microphone and camera disabled. The page may ask "Do you want people to see and hear you in the meeting?" and show an "Allow microphone and camera" button. Ignore that entire prompt. Never click "Allow microphone and camera", never use the page info icon, and never enable browser site permissions.
+3. If a modal says "Meet is blocked from using your microphone and camera", click its "Close dialog" button (the X) immediately. This is expected when joining silently and is not a reason to stop. Do not interact with elements behind the modal until it is closed.
+4. If and only if a visible button says "Continue without microphone and camera", click that button.
+5. If a visible guest name field exists, fill it with "{display_name}".
+6. If microphone or camera toggles are on in the pre-join screen, turn them off.
+7. Click the best available join button, preferring "Ask to join", then "Join now", then "Request to join", then "Join".
+8. Treat the guest pre-join area as the source of truth. If the page shows a name input and a join button, continue the guest join flow even if a top-right "Sign in" link, tooltip, or helper bubble is also visible.
+9. Do not treat a generic top-right "Sign in" link or tooltip as a blocking condition by itself. Only treat sign-in as blocking if the main page content explicitly says sign-in is required or the meeting cannot be joined without it.
+10. If the page says host approval is required, the request was denied, or the meeting cannot be joined, stop and report the exact visible reason.
+11. After clicking the join button, remain on the meeting page and do not navigate away.
+12. Finish only after you have either joined successfully or clearly determined that Google Meet blocked entry.
 """.strip()
 
 
@@ -348,16 +350,19 @@ def classify_join_failure(status):
 
 async def ensure_joined(page, timeout_ms=20000):
     deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+    last_status = None
 
     while asyncio.get_running_loop().time() < deadline:
         status = await get_meeting_status(page)
-        if status and (status["waiting_for_host"] or status["denied"] or status["blocked"]):
-            return False
+        if status:
+            last_status = status
+            if status["denied"] or status["blocked"]:
+                return False, status
         if status and status["has_joined_control"]:
-            return True
+            return True, status
         await asyncio.sleep(2)
 
-    return False
+    return False, last_status
 
 
 async def get_participant_count(page):
@@ -402,11 +407,13 @@ def should_leave_when_only_orbit_remains(state, participant_count):
         state.observed_other_participants = True
         state.solo_participant_polls = 0
         return False
-    if participant_count != 1 or not state.observed_other_participants:
+    if participant_count != 1:
         state.solo_participant_polls = 0
         return False
 
     state.solo_participant_polls += 1
+    if not state.observed_other_participants:
+        return state.solo_participant_polls >= (SOLO_PARTICIPANT_POLLS_BEFORE_LEAVE + 1)
     return state.solo_participant_polls >= SOLO_PARTICIPANT_POLLS_BEFORE_LEAVE
 
 
@@ -1098,7 +1105,6 @@ async def run_meeting_session(config, callbacks=None, state=None):
     from browser_use import Agent, Browser, ChatOpenAI
     configure_dependency_logging()
 
-    llm = ChatOpenAI(model=config.model_name)
     browser = None
     history = None
 
@@ -1109,16 +1115,29 @@ async def run_meeting_session(config, callbacks=None, state=None):
 
     try:
         browser = build_browser(Browser, state=state, session_config=config)
+        agent_model = os.environ.get("ORBIT_BROWSER_AGENT_MODEL", config.model_name)
+        fallback_agent_model = os.environ.get(
+            "ORBIT_BROWSER_AGENT_FALLBACK_MODEL", "gpt-4o-mini"
+        )
+        log(f"Agent model: {agent_model}", state.session_id, level="debug")
+        if fallback_agent_model:
+            log(f"Fallback agent model: {fallback_agent_model}", state.session_id, level="debug")
+        llm = ChatOpenAI(model=agent_model)
+        fallback_llm = None
+        if fallback_agent_model and fallback_agent_model != agent_model:
+            fallback_llm = ChatOpenAI(model=fallback_agent_model)
+
         agent: Any = Agent(
             task=build_task(config.meet_url, config.display_name),
             llm=llm,
             browser=browser,
             use_vision=True,
             max_failures=3,
+            fallback_llm=fallback_llm,
+            use_thinking=False,
             save_conversation_path=str(session_conversation_dir),
             generate_gif=str(session_gif_path),
         )
-
         history = await agent.run(max_steps=config.max_steps)
         log(f"Agent finished after {history.number_of_steps()} steps.", state.session_id, level="debug")
 
@@ -1153,7 +1172,7 @@ async def run_meeting_session(config, callbacks=None, state=None):
             await asyncio.sleep(config.wait_after_join_ms / 1000)
             return state
 
-        joined = await ensure_joined(page)
+        joined, final_join_status = await ensure_joined(page)
         if joined:
             state.joined_at = now_iso()
             detail = f"Orbit joined the meeting successfully. Monitoring chat for {config.wait_after_join_ms // 1000} seconds."
@@ -1231,7 +1250,7 @@ async def run_meeting_session(config, callbacks=None, state=None):
                         )
             await monitor_chat(page, state, config.wait_after_join_ms, callbacks)
         else:
-            status = await get_meeting_status(page)
+            status = final_join_status or await get_meeting_status(page)
             join_status, detail = classify_join_failure(status)
             await emit_status(callbacks, state, join_status, detail)
             log(

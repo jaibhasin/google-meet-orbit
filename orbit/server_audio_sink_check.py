@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import platform
 import re
 import shutil
 import secrets
 from dataclasses import dataclass
 
 from orbit.audio_capture import build_ffmpeg_command, generate_sink_name
+
+
+DARWIN_UNSUPPORTED_MESSAGE = (
+    "server_audio_sink is Linux-only for now because it depends on PulseAudio/PipeWire pactl. "
+    "On macOS, use ORBIT_AUDIO_CAPTURE_STRATEGY=chrome_extension or run this check on a Linux host/container."
+)
 
 
 @dataclass
@@ -170,6 +177,19 @@ async def check_server_audio_sink_runtime(
     sink_name = sink_name or generate_sink_name(
         f"check-{os.getpid()}-{secrets.token_hex(2)}"
     )
+    if platform.system() == "Darwin":
+        return CheckReport(
+            sink_name=sink_name,
+            module_id=None,
+            steps=[
+                CheckStep(
+                    name="platform",
+                    ok=False,
+                    detail=DARWIN_UNSUPPORTED_MESSAGE,
+                )
+            ],
+        )
+
     module_id: str | None = None
     ffmpeg_process = None
 
@@ -314,6 +334,10 @@ def _format_report(report: CheckReport) -> list[str]:
 
 async def main() -> int:
     args = build_parser().parse_args()
+    if platform.system() == "Darwin":
+        print(DARWIN_UNSUPPORTED_MESSAGE)
+        return 1
+
     report = await check_server_audio_sink_runtime(sink_name=args.sink_name)
     for line in _format_report(report):
         print(line)

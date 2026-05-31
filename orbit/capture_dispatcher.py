@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from orbit.agent.tools._shared import (
-    ConfigurationError,
-    _require_google_meet_url,
-    _require_uuid,
-)
+from orbit.capture_service_registry import get_capture_service
 from orbit.core import log
 from orbit.whatsapp_service import OrbitWhatsAppService
 
@@ -17,6 +13,12 @@ async def enqueue_meeting_capture(
     requested_by_person_id: str | None = None,
     capture_session_id: str | None = None,
 ) -> None:
+    from orbit.agent.tools._shared import (
+        ConfigurationError,
+        _require_google_meet_url,
+        _require_uuid,
+    )
+
     meeting_id = _require_uuid(
         meeting_id,
         field_name="meeting_id",
@@ -39,7 +41,7 @@ async def enqueue_meeting_capture(
         level="info",
     )
 
-    service = OrbitWhatsAppService()
+    service = get_capture_service() or OrbitWhatsAppService()
     result = await service.start_meeting_capture_session(
         meeting_id=meeting_id,
         meet_url=gmeet_url,

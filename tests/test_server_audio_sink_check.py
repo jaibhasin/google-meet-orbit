@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import io
+import runpy
+from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import unittest
 
@@ -40,9 +43,40 @@ class FakeSubprocess:
 class ServerAudioSinkCheckTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._orig_which = server_audio_sink_check.shutil.which
+        self._platform_patcher = patch.object(server_audio_sink_check.platform, "system", return_value="Linux")
+        self._platform_patcher.start()
 
     async def asyncTearDown(self):
+        self._platform_patcher.stop()
         server_audio_sink_check.shutil.which = self._orig_which
+
+    async def test_darwin_reports_linux_only_message_without_binary_checks(self):
+        with patch.object(server_audio_sink_check.platform, "system", return_value="Darwin"):
+            with patch.object(server_audio_sink_check.shutil, "which") as which:
+                with patch("orbit.server_audio_sink_check._run_command", new_callable=AsyncMock) as run_command:
+                    report = await server_audio_sink_check.check_server_audio_sink_runtime(
+                        sink_name="orbit_meet_test"
+                    )
+
+        self.assertFalse(report.ok)
+        self.assertEqual(len(report.steps), 1)
+        self.assertEqual(report.steps[0].name, "platform")
+        self.assertEqual(report.steps[0].detail, server_audio_sink_check.DARWIN_UNSUPPORTED_MESSAGE)
+        self.assertIsNone(report.steps[0].suggestion)
+        which.assert_not_called()
+        run_command.assert_not_awaited()
+
+    async def test_darwin_wrapper_prints_linux_only_message(self):
+        stdout = io.StringIO()
+        script_path = Path(__file__).resolve().parents[1] / "scripts" / "check_server_audio_sink.py"
+
+        with patch("platform.system", return_value="Darwin"):
+            with redirect_stdout(stdout):
+                with self.assertRaises(SystemExit) as exc_info:
+                    runpy.run_path(str(script_path), run_name="__main__")
+
+        self.assertEqual(exc_info.exception.code, 1)
+        self.assertEqual(stdout.getvalue().strip(), server_audio_sink_check.DARWIN_UNSUPPORTED_MESSAGE)
 
     async def test_missing_ffmpeg_reports_failure(self):
         with patch.dict("os.environ", {}, clear=False):

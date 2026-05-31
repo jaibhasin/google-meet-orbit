@@ -35,29 +35,33 @@ class WhatsAppAppTests(unittest.TestCase):
             service.twilio_auth_token = "test-auth-token"
             service_cls.return_value = service
 
-            with patch("orbit.whatsapp_app.handle_whatsapp_command") as handler:
-                handler.return_value = "help text"
+            with patch("orbit.whatsapp_app.register_capture_service") as register_service:
+                with patch("orbit.whatsapp_app.unregister_capture_service") as unregister_service:
+                    with patch("orbit.whatsapp_app.handle_whatsapp_command") as handler:
+                        handler.return_value = "help text"
 
-                with patch("orbit.agent.tools.whatsapp_tools.send_whatsapp_reply") as send_reply:
-                    with TestClient(app) as client:
-                        request_url = "http://testserver/twilio/whatsapp"
-                        signature = RequestValidator("test-auth-token").compute_signature(
-                            request_url,
-                            {
-                                "From": "whatsapp:+15551234567",
-                                "Body": "help",
-                            },
-                        )
+                        with patch("orbit.agent.tools.whatsapp_tools.send_whatsapp_reply") as send_reply:
+                            with TestClient(app) as client:
+                                request_url = "http://testserver/twilio/whatsapp"
+                                signature = RequestValidator("test-auth-token").compute_signature(
+                                    request_url,
+                                    {
+                                        "From": "whatsapp:+15551234567",
+                                        "Body": "help",
+                                    },
+                                )
 
-                        response = client.post(
-                            "/twilio/whatsapp",
-                            data={"From": "whatsapp:+15551234567", "Body": "help"},
-                            headers={"X-Twilio-Signature": signature},
-                        )
+                                response = client.post(
+                                    "/twilio/whatsapp",
+                                    data={"From": "whatsapp:+15551234567", "Body": "help"},
+                                    headers={"X-Twilio-Signature": signature},
+                                )
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("application/xml", response.headers["content-type"])
         self.assertEqual(response.text, "<Response><Message>help text</Message></Response>")
+        register_service.assert_called_once_with(service)
+        unregister_service.assert_called_once_with(service)
         handler.assert_awaited_once_with("whatsapp:+15551234567", "help")
         send_reply.assert_not_called()
 

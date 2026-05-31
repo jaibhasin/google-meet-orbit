@@ -131,9 +131,13 @@ function testContentScriptDisplaysActiveStatus() {
     },
     console,
     document: {
+      addEventListener() {},
       getElementById(id) {
         assert.equal(id, "orbit-audio-capture-button");
         return button;
+      },
+      querySelectorAll() {
+        return [];
       }
     },
     window: {
@@ -153,9 +157,80 @@ function testContentScriptDisplaysActiveStatus() {
   assert.equal(button.style.opacity, "0.72");
 }
 
+function testContentScriptSuppressesMeetMediaPermissionControl() {
+  const documentListeners = [];
+  const allowButton = {
+    dataset: {},
+    style: {},
+    textContent: "Allow microphone and camera",
+    getAttribute() {
+      return null;
+    }
+  };
+
+  const context = {
+    chrome: {
+      runtime: {
+        onMessage: {
+          addListener() {}
+        }
+      }
+    },
+    console,
+    document: {
+      addEventListener(type, listener, capture) {
+        documentListeners.push({ type, listener, capture });
+      },
+      querySelectorAll() {
+        return [allowButton];
+      }
+    },
+    window: {
+      addEventListener() {}
+    }
+  };
+
+  vm.runInNewContext(
+    fs.readFileSync(path.join(extensionDir, "content.js"), "utf8"),
+    context
+  );
+
+  assert.equal(allowButton.dataset.orbitSuppressed, "allow-media");
+  assert.equal(allowButton.style.display, "none");
+
+  const clickListener = documentListeners.find(({ type }) => type === "click");
+  assert.equal(clickListener.capture, true);
+
+  const event = {
+    prevented: false,
+    propagationStopped: false,
+    immediatePropagationStopped: false,
+    target: {
+      closest() {
+        return allowButton;
+      }
+    },
+    preventDefault() {
+      this.prevented = true;
+    },
+    stopPropagation() {
+      this.propagationStopped = true;
+    },
+    stopImmediatePropagation() {
+      this.immediatePropagationStopped = true;
+    }
+  };
+  clickListener.listener(event);
+
+  assert.equal(event.prevented, true);
+  assert.equal(event.propagationStopped, true);
+  assert.equal(event.immediatePropagationStopped, true);
+}
+
 async function main() {
   await testToolbarActivationReportsStatus();
   testContentScriptDisplaysActiveStatus();
+  testContentScriptSuppressesMeetMediaPermissionControl();
   console.log("Orbit audio capture extension tests passed.");
 }
 

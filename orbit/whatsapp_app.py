@@ -16,6 +16,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Response, WebSocket  
 from twilio.request_validator import RequestValidator  # noqa: E402
 
 from orbit.whatsapp_service import OrbitWhatsAppService  # noqa: E402
+from orbit.capture_service_registry import register_capture_service, unregister_capture_service  # noqa: E402
 from orbit.meeting_intelligence_routes import router as meeting_intelligence_router  # noqa: E402
 from orbit.agent.whatsapp.command_handler import handle_whatsapp_command  # noqa: E402
 
@@ -59,8 +60,13 @@ def normalize_bind_host(raw_host):
 @asynccontextmanager
 async def lifespan(app):
     load_dotenv()
-    app.state.orbit_service = OrbitWhatsAppService()
-    yield
+    service = OrbitWhatsAppService()
+    app.state.orbit_service = service
+    register_capture_service(service)
+    try:
+        yield
+    finally:
+        unregister_capture_service(service)
 
 
 app = FastAPI(lifespan=lifespan)

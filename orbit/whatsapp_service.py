@@ -403,10 +403,25 @@ class OrbitWhatsAppService:
             if len(self.active_sessions) >= self.max_parallel_meetings:
                 return {"status": "capacity", "meeting_code": meeting_code}
 
+            session_id = self.build_session_id(meeting_code)
             meeting_record = await self._create_meeting_record(meet_url, from_number, profile_name)
             meeting_id, source_id = meeting_record
-            session_id = self.build_session_id(meeting_code)
-            config = self.build_session_config(meet_url, session_id)
+            capture_session_id = None
+            if meeting_id and source_id:
+                store = getattr(self, "meeting_store", None)
+                create_capture_session = getattr(store, "create_capture_session", None)
+                if callable(create_capture_session):
+                    try:
+                        capture_session = await create_capture_session(
+                            meeting_id,
+                            source_id,
+                            capture_strategy=get_audio_capture_strategy(),
+                            stt_provider="deepgram",
+                        )
+                        capture_session_id = capture_session.get("id") if isinstance(capture_session, dict) else None
+                    except Exception as error:
+                        log(f"Failed to create capture session for {meeting_id}: {error}", session_id, level="error")
+            config = self.build_session_config(meet_url, session_id, capture_session_id=capture_session_id)
             state = build_meeting_state(config)
             active = ActiveMeeting(
                 session_id=session_id,
@@ -414,6 +429,7 @@ class OrbitWhatsAppService:
                 state=state,
                 meeting_id=meeting_id,
                 source_id=source_id,
+                capture_session_id=capture_session_id,
                 created_at=now_iso(),
             )
             self.active_sessions[session_id] = active

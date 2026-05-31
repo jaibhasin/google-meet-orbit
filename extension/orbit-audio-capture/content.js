@@ -1,3 +1,47 @@
+const ALLOW_MEDIA_PATTERN = /allow\s+(?:microphone\s+and\s+camera|camera\s+and\s+microphone)/i;
+
+function controlLabel(node) {
+  if (!node) return "";
+  return [
+    node.getAttribute && node.getAttribute("aria-label"),
+    node.getAttribute && node.getAttribute("title"),
+    node.textContent
+  ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+}
+
+function isAllowMediaControl(node) {
+  return Boolean(node && ALLOW_MEDIA_PATTERN.test(controlLabel(node)));
+}
+
+function suppressAllowMediaControls(root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  for (const node of root.querySelectorAll("button, [role='button']")) {
+    if (!isAllowMediaControl(node) || node.dataset.orbitSuppressed === "allow-media") continue;
+    node.dataset.orbitSuppressed = "allow-media";
+    node.style.display = "none";
+  }
+}
+
+if (typeof document.addEventListener === "function") {
+  document.addEventListener("click", (event) => {
+    const control = event.target && event.target.closest
+      ? event.target.closest("button, [role='button']")
+      : null;
+    if (!isAllowMediaControl(control)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }, true);
+}
+
+suppressAllowMediaControls(document);
+if (typeof MutationObserver !== "undefined" && document.documentElement) {
+  new MutationObserver(() => suppressAllowMediaControls(document)).observe(
+    document.documentElement,
+    { childList: true, subtree: true }
+  );
+}
+
 window.addEventListener("message", (event) => {
   if (event.source !== window) return;
   const message = event.data || {};

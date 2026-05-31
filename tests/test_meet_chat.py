@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from orbit.meet import (
     build_intro_message,
+    build_task,
     finalize_meeting_status,
     get_participant_count,
+    ensure_joined,
     is_orbit_authored_message,
     monitor_chat,
     should_leave_when_only_orbit_remains,
@@ -16,6 +19,13 @@ from orbit.meet_types import ChatMessage, MeetingState
 
 
 class MeetChatTests(unittest.TestCase):
+    def test_join_task_handles_blocked_media_modal_without_enabling_permissions(self):
+        task = build_task("https://meet.google.com/abc-defg-hij", "Orbit")
+
+        self.assertIn('Never click "Allow microphone and camera"', task)
+        self.assertIn('click its "Close dialog" button (the X) immediately', task)
+        self.assertIn("is not a reason to stop", task)
+
     def test_orbit_intro_is_detected_as_orbit_authored(self):
         state = MeetingState(
             session_id="session-1",
@@ -110,6 +120,13 @@ class ParticipantExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(should_leave_when_only_orbit_remains(state, None))
         self.assertFalse(should_leave_when_only_orbit_remains(state, 1))
 
+    async def test_leaves_after_solo_poll_threshold_without_other_participants(self):
+        state = self.build_state()
+
+        self.assertFalse(should_leave_when_only_orbit_remains(state, 1))
+        self.assertFalse(should_leave_when_only_orbit_remains(state, 1))
+        self.assertTrue(should_leave_when_only_orbit_remains(state, 1))
+
     @patch("orbit.meet.process_messages", new_callable=AsyncMock)
     @patch("orbit.meet.collect_visible_chat_messages", new_callable=AsyncMock, return_value=[])
     @patch("orbit.meet.collect_visible_captions", new_callable=AsyncMock)
@@ -163,6 +180,48 @@ class ParticipantExitTests(unittest.IsolatedAsyncioTestCase):
             state.leave_reason,
             "Orbit was asked from WhatsApp to stop monitoring this meeting.",
         )
+
+
+class JoinDetectionTests(unittest.IsolatedAsyncioTestCase):
+    class FakePage:
+        def __init__(self, results):
+            self.results = iter(results)
+
+        async def evaluate(self, script, *args):
+            value = next(self.results)
+            return value if isinstance(value, str) else json.dumps(value)
+
+    @patch("orbit.meet.asyncio.sleep", new_callable=AsyncMock)
+    async def test_waiting_for_host_then_joins(self, sleep):
+        page = self.FakePage(
+            [
+                {"waiting_for_host": True, "denied": False, "blocked": False, "has_joined_control": False},
+                {"waiting_for_host": True, "denied": False, "blocked": False, "has_joined_control": False},
+                {"waiting_for_host": False, "denied": False, "blocked": False, "has_joined_control": True},
+            ]
+        )
+
+        joined, status = await ensure_joined(page, timeout_ms=9000)
+
+        self.assertTrue(joined)
+        self.assertIsNotNone(status)
+        self.assertTrue(status["has_joined_control"])
+        self.assertGreaterEqual(sleep.await_count, 2)
+
+    @patch("orbit.meet.asyncio.sleep", new_callable=AsyncMock)
+    async def test_denied_join_stays_not_joined(self, sleep):
+        page = self.FakePage(
+            [
+                {"waiting_for_host": True, "denied": False, "blocked": False, "has_joined_control": False},
+                {"waiting_for_host": False, "denied": True, "blocked": False, "has_joined_control": False},
+            ]
+        )
+
+        joined, status = await ensure_joined(page, timeout_ms=9000)
+
+        self.assertFalse(joined)
+        self.assertIsNotNone(status)
+        self.assertTrue(status["denied"])
 
 
 class TriggerExtensionAudioCaptureTests(unittest.IsolatedAsyncioTestCase):
