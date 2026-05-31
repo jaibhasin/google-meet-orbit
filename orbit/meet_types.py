@@ -44,6 +44,7 @@ class MeetingState:
     live_stt_started: bool = False
     live_stt_audio_confirmed_at: str | None = None
     live_stt_audio_token: str | None = None
+    audio_capture_strategy: str | None = None
     live_stt_status_detail: str | None = None
     live_transcript_segments: list[TranscriptSegment] = field(default_factory=list)
     observed_other_participants: bool = False

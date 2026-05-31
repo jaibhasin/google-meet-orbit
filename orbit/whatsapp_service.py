@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from orbit.audio_capture import get_audio_capture_strategy, start_server_audio_sink_capture
 from orbit.core import (
     env_int,
     configure_dependency_logging,
@@ -81,6 +82,11 @@ CAPTURE_HEARTBEAT_INTERVAL_SECONDS = 15
 CAPTURE_AUDIO_METADATA_FLUSH_CHUNKS = 25
 CAPTURE_AUDIO_METADATA_FLUSH_INTERVAL_SECONDS = 5
 DEEPGRAM_KEEPALIVE_INTERVAL_SECONDS = 5
+FFMPEG_START_ERROR_CODE = "FFMPEG_START_FAILED"
+NO_AUDIO_FROM_SINK_ERROR_CODE = "NO_AUDIO_FROM_SINK"
+FFMPEG_STREAM_ENDED_ERROR_CODE = "FFMPEG_STREAM_ENDED"
+AUDIO_SINK_CREATE_ERROR_CODE = "AUDIO_SINK_CREATE_FAILED"
+FFMPEG_STREAM_EXITED_WITHOUT_CHUNKS = "No audio reached Orbit from the server audio sink."
 MEETING_EXTRACTION_PROMPT_VERSION = "meeting-extractor-v1"
 MEETING_EXTRACTION_RUN_TYPE = "full_meeting_extraction"
 MEETING_EXTRACT_PROMPT = """You are extracting structured company memory from a meeting transcript.
@@ -128,6 +134,9 @@ class ActiveMeeting:
     last_capture_heartbeat_at: float = 0.0
     capture_failure_recorded: bool = False
     capture_health_metadata: dict = field(default_factory=default_capture_session_metadata)
+    server_audio_sink_handle: object | None = None
+    server_audio_reader_task: asyncio.Task | None = None
+    live_stt_session: object | None = None
     audio_chunks_since_metadata_flush: int = 0
     last_capture_metadata_flush_at: float = 0.0
     audio_silence_gate: PCM16SilenceGate | None = None
@@ -488,8 +497,23 @@ class OrbitWhatsAppService:
             on_orbit_mention=self.handle_orbit_mention,
             on_finished=self.handle_session_finished,
         )
+        active.state.audio_capture_strategy = get_audio_capture_strategy()
         await self._update_capture_session_status(active, "starting")
         try:
+            if (
+                config.live_stt_enabled
+                and active.state.audio_capture_strategy == "server_audio_sink"
+            ):
+                try:
+                    await self._start_server_audio_sink_capture(active)
+                except Exception as error:
+                    error_message = self._safe_capture_error(error)
+                    await self._mark_capture_session_failed(
+                        active,
+                        self._classify_server_audio_capture_error(error_message),
+                        f"Could not start server-side audio sink capture. {error_message or 'See logs for details.'}",
+                    )
+                    active.state.live_stt_available = False
             await run_meeting_session(config, callbacks=callbacks, state=active.state)
         except asyncio.CancelledError:
             await self._mark_capture_session_failed(
@@ -506,8 +530,129 @@ class OrbitWhatsAppService:
             )
             raise
         finally:
+            await self._stop_server_audio_sink_capture(active)
             async with self.lock:
                 self.active_sessions.pop(active.session_id, None)
+
+    @staticmethod
+    def _get_ffmpeg_pid(handle):
+        process = getattr(handle, "ffmpeg_process", None)
+        return getattr(process, "pid", None)
+
+    def _classify_server_audio_capture_error(self, error_message):
+        normalized = (error_message or "").lower()
+        if "pactl" in normalized or "load-module" in normalized or "sink" in normalized:
+            return AUDIO_SINK_CREATE_ERROR_CODE
+        return FFMPEG_START_ERROR_CODE
+
+    async def _start_server_audio_sink_capture(self, active):
+        if active.server_audio_sink_handle is not None:
+            return
+        if not active.capture_session_id:
+            active.state.live_stt_available = False
+            return
+        handle = await start_server_audio_sink_capture(
+            active.session_id,
+            active.capture_session_id,
+        )
+        if not handle:
+            active.state.live_stt_available = False
+            return
+        active.server_audio_sink_handle = handle
+        active.state.live_stt_available = True
+        now = now_iso()
+        metadata = {
+            "audio_capture": {
+                "strategy": "server_audio_sink",
+                "sink_name": handle.sink_name,
+                "ffmpeg_pid": self._get_ffmpeg_pid(handle),
+                "started_at": now,
+                "stopped_at": None,
+                "error": None,
+            }
+        }
+        await self._update_capture_session_metadata(active, metadata)
+        if getattr(handle, "ffmpeg_process", None) is None:
+            return
+        active.server_audio_reader_task = asyncio.create_task(
+            self._run_server_audio_sink_reader(active),
+        )
+
+    async def _run_server_audio_sink_reader(self, active):
+        handle = active.server_audio_sink_handle if active else None
+        if not handle:
+            return
+        process = getattr(handle, "ffmpeg_process", None)
+        if not process:
+            return
+        stdout = getattr(process, "stdout", None)
+        if not stdout:
+            return
+        saw_forwarded_audio = False
+        ffmpeg_audio_format = LiveAudioFormat()
+        try:
+            while True:
+                chunk = await stdout.read(4096)
+                if not chunk:
+                    break
+                was_forwarded = await self._forward_audio_chunk_for_session(
+                    active,
+                    chunk,
+                    ffmpeg_audio_format,
+                )
+                saw_forwarded_audio = saw_forwarded_audio or was_forwarded
+            return_code = process.returncode
+            if return_code is None:
+                return_code = await process.wait()
+            if not saw_forwarded_audio and not active.capture_failure_recorded:
+                await self._mark_capture_session_failed(
+                    active,
+                    NO_AUDIO_FROM_SINK_ERROR_CODE,
+                    FFMPEG_STREAM_EXITED_WITHOUT_CHUNKS,
+                    metadata={"audio_capture": {"ffmpeg_exit_code": return_code}},
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not active.capture_failure_recorded:
+                await self._mark_capture_session_failed(
+                    active,
+                    FFMPEG_STREAM_ENDED_ERROR_CODE,
+                    f"Server-side audio reader failed: {self._safe_capture_error(error)}",
+                )
+
+    async def _stop_server_audio_sink_capture(self, active):
+        task = active.server_audio_reader_task if active else None
+        active.server_audio_reader_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                log(
+                    f"Server audio reader cleanup failed for {active.session_id}: {error}",
+                    active.session_id,
+                    level="error",
+                )
+
+        handle = active.server_audio_sink_handle if active else None
+        if handle is None:
+            return
+        active.server_audio_sink_handle = None
+        try:
+            await handle.stop()
+        except Exception as error:
+            log(
+                f"Server audio sink cleanup failed for {active.session_id}: {error}",
+                active.session_id,
+                level="error",
+            )
+        await self._update_capture_session_metadata(
+            active,
+            {"audio_capture": {"stopped_at": now_iso()}},
+        )
 
     async def _update_capture_session_status(self, active, status, metadata=None):
         if not active or not active.capture_session_id:
@@ -730,6 +875,61 @@ class OrbitWhatsAppService:
         audio = self._audio_health(active)
         audio["silent_or_empty_chunk_count"] = int(audio.get("silent_or_empty_chunk_count") or 0) + 1
         active.audio_chunks_since_metadata_flush += 1
+
+    async def _forward_audio_chunk_for_session(
+        self,
+        active,
+        chunk: bytes,
+        audio_format: LiveAudioFormat | None = None,
+    ) -> bool:
+        if not active or not chunk:
+            self._record_empty_audio_chunk(active)
+            await self._flush_capture_audio_health(active)
+            return False
+
+        self._record_audio_chunk_received(active, len(chunk))
+        gate = self._get_or_create_audio_silence_gate(active, audio_format)
+        gate_result = gate.process(chunk)
+        self._record_audio_classification(active, gate_result)
+
+        session = await self._get_or_create_live_stt_session(active, audio_format)
+        for forwarded_chunk in gate_result.chunks_to_forward:
+            await session.send_audio(forwarded_chunk)
+            self._record_audio_chunk_forwarded(active, len(forwarded_chunk))
+
+        if gate_result.chunks_to_forward and not active.state.live_stt_started:
+            active.state.live_stt_started = True
+            active.state.live_stt_audio_confirmed_at = now_iso()
+            active.state.live_stt_status_detail = (
+                "Deepgram stream connected and first audio chunk forwarded."
+            )
+            await self.send_whatsapp_message(
+                f"Orbit confirmed live audio transcription for Meet "
+                f"{active.state.meeting_code}."
+            )
+            await self._update_capture_session_status(
+                active,
+                "streaming_audio",
+                metadata={"audio": dict(self._audio_health(active))},
+            )
+            active.audio_chunks_since_metadata_flush = 0
+            active.last_capture_metadata_flush_at = asyncio.get_running_loop().time()
+            active.last_capture_heartbeat_at = asyncio.get_running_loop().time()
+        else:
+            await self._flush_capture_audio_health(active)
+            await self._heartbeat_capture_session(active)
+
+        if gate_result.silence_gated:
+            await self._send_deepgram_keepalive_if_due(active, session)
+        return bool(gate_result.chunks_to_forward)
+
+    async def _get_or_create_live_stt_session(self, active, audio_format=None):
+        if active.live_stt_session is None:
+            active.live_stt_session = await self.live_stt.get_or_create(
+                active.state,
+                audio_format,
+            )
+        return active.live_stt_session
 
     def _get_or_create_audio_silence_gate(self, active, audio_format=None):
         if active.audio_silence_gate is None:
@@ -1902,48 +2102,15 @@ class OrbitWhatsAppService:
             return
 
         await websocket.accept()
-        session = None
         try:
             while True:
                 message = await websocket.receive()
                 if message.get("bytes") is not None:
                     chunk = message["bytes"]
-                    if not chunk:
-                        self._record_empty_audio_chunk(active)
-                        await self._flush_capture_audio_health(active)
-                        continue
-                    self._record_audio_chunk_received(active, len(chunk))
-                    gate = self._get_or_create_audio_silence_gate(active)
-                    gate_result = gate.process(chunk)
-                    self._record_audio_classification(active, gate_result)
-                    for forwarded_chunk in gate_result.chunks_to_forward:
-                        if session is None:
-                            session = await self.live_stt.get_or_create(active.state)
-                        await session.send_audio(forwarded_chunk)
-                        self._record_audio_chunk_forwarded(active, len(forwarded_chunk))
-                    if gate_result.chunks_to_forward and not active.state.live_stt_started:
-                        active.state.live_stt_started = True
-                        active.state.live_stt_audio_confirmed_at = now_iso()
-                        active.state.live_stt_status_detail = (
-                            "Deepgram stream connected and first audio chunk forwarded."
-                        )
-                        await self.send_whatsapp_message(
-                            f"Orbit confirmed live audio transcription for Meet "
-                            f"{active.state.meeting_code}."
-                        )
-                        await self._update_capture_session_status(
-                            active,
-                            "streaming_audio",
-                            metadata={"audio": dict(self._audio_health(active))},
-                        )
-                        active.audio_chunks_since_metadata_flush = 0
-                        active.last_capture_metadata_flush_at = asyncio.get_running_loop().time()
-                        active.last_capture_heartbeat_at = asyncio.get_running_loop().time()
-                    else:
-                        await self._flush_capture_audio_health(active)
-                        await self._heartbeat_capture_session(active)
-                    if gate_result.silence_gated:
-                        await self._send_deepgram_keepalive_if_due(active, session)
+                    await self._forward_audio_chunk_for_session(
+                        active,
+                        chunk,
+                    )
                     continue
 
                 raw_text = message.get("text")
@@ -1955,7 +2122,10 @@ class OrbitWhatsAppService:
                 if message_type in {"start", "config"}:
                     audio_format = LiveAudioFormat.from_payload(payload)
                     self._get_or_create_audio_silence_gate(active, audio_format)
-                    session = await self.live_stt.get_or_create(active.state, audio_format)
+                    active.live_stt_session = await self.live_stt.get_or_create(
+                        active.state,
+                        audio_format,
+                    )
                     active.state.live_stt_status_detail = (
                         "Extension audio WebSocket connected. Waiting for the first audio chunk."
                     )

@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from orbit.caption_attribution import CaptionSnippet
+from orbit.audio_capture import get_audio_capture_strategy
 from orbit.core import (
     CONVERSATION_DIR,
     DEBUG_DIR,
@@ -1050,25 +1051,49 @@ async def run_meeting_session(config, callbacks=None, state=None):
             if config.live_stt_enabled:
                 state.live_stt_requested = True
                 await enable_captions(page, state.session_id)
-                state.live_stt_available = await trigger_extension_audio_capture(
-                    page,
-                    state,
-                    config.audio_stream_ws_url,
-                )
-                if state.live_stt_available:
-                    await emit_status(
-                        callbacks,
-                        state,
-                        "live_stt_capture_requested",
-                        "Orbit requested tab audio capture through the Chrome extension. Click the in-page Orbit audio button if Chrome requires manual activation.",
-                    )
+                capture_strategy = state.audio_capture_strategy or get_audio_capture_strategy()
+                state.audio_capture_strategy = capture_strategy
+                if capture_strategy == "server_audio_sink":
+                    state.live_stt_available = bool(getattr(state, "live_stt_available", False))
+                    if not state.live_stt_available:
+                        await emit_status(
+                            callbacks,
+                            state,
+                            "live_stt_unavailable",
+                            "Server-side audio sink capture failed to initialize.",
+                        )
+                    else:
+                        state.live_stt_status_detail = (
+                            "Orbit requested server-side audio capture. "
+                            "Best-effort routing of browser audio to the dedicated sink is pending."
+                        )
+                        await emit_status(
+                            callbacks,
+                            state,
+                            "live_stt_capture_requested",
+                            "Orbit requested server-side audio capture. "
+                            "Browser audio will be captured from the dedicated sink stream.",
+                        )
                 else:
-                    await emit_status(
-                        callbacks,
+                    state.live_stt_available = await trigger_extension_audio_capture(
+                        page,
                         state,
-                        "live_stt_unavailable",
-                        state.live_stt_status_detail or "Orbit could not trigger tab audio capture.",
+                        config.audio_stream_ws_url,
                     )
+                    if state.live_stt_available:
+                        await emit_status(
+                            callbacks,
+                            state,
+                            "live_stt_capture_requested",
+                            "Orbit requested tab audio capture through the Chrome extension. Click the in-page Orbit audio button if Chrome requires manual activation.",
+                        )
+                    else:
+                        await emit_status(
+                            callbacks,
+                            state,
+                            "live_stt_unavailable",
+                            state.live_stt_status_detail or "Orbit could not trigger tab audio capture.",
+                        )
             await monitor_chat(page, state, config.wait_after_join_ms, callbacks)
         else:
             status = await get_meeting_status(page)
