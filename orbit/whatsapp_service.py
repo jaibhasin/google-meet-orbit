@@ -444,7 +444,7 @@ class OrbitWhatsAppService:
                 return {"status": "capacity", "meeting_code": meeting_code}
 
             session_id = self.build_session_id(meeting_code)
-            config = self.build_session_config(meet_url, session_id)
+            config = self.build_session_config(meet_url, session_id, capture_session_id=capture_session_id)
             state = build_meeting_state(config)
             active = ActiveMeeting(
                 session_id=session_id,
@@ -497,7 +497,16 @@ class OrbitWhatsAppService:
             on_orbit_mention=self.handle_orbit_mention,
             on_finished=self.handle_session_finished,
         )
-        active.state.audio_capture_strategy = get_audio_capture_strategy()
+        active.state.audio_capture_strategy = (
+            getattr(config, "audio_capture_strategy", None) or get_audio_capture_strategy()
+        )
+        active.state.capture_session_id = active.capture_session_id
+        if active.state.audio_capture_strategy == "server_audio_sink":
+            active.state.audio_capture_routing_mode = "not_implemented"
+            active.state.browser_audio_routed = False
+            active.state.browser_process_isolated = True
+            active.state.audio_sink_name = getattr(config, "audio_sink_name", None)
+            config.capture_session_id = active.capture_session_id
         await self._update_capture_session_status(active, "starting")
         try:
             if (
@@ -505,7 +514,7 @@ class OrbitWhatsAppService:
                 and active.state.audio_capture_strategy == "server_audio_sink"
             ):
                 try:
-                    await self._start_server_audio_sink_capture(active)
+                    await self._start_server_audio_sink_capture(active, config=config)
                 except Exception as error:
                     error_message = self._safe_capture_error(error)
                     await self._mark_capture_session_failed(
@@ -530,6 +539,17 @@ class OrbitWhatsAppService:
             )
             raise
         finally:
+            if active.state.audio_capture_strategy == "server_audio_sink":
+                await self._update_capture_session_metadata(
+                    active,
+                    {
+                        "audio_capture": {
+                            "routing_mode": active.state.audio_capture_routing_mode,
+                            "browser_audio_routed": active.state.browser_audio_routed,
+                            "browser_process_isolated": active.state.browser_process_isolated,
+                        }
+                    },
+                )
             await self._stop_server_audio_sink_capture(active)
             async with self.lock:
                 self.active_sessions.pop(active.session_id, None)
@@ -545,7 +565,7 @@ class OrbitWhatsAppService:
             return AUDIO_SINK_CREATE_ERROR_CODE
         return FFMPEG_START_ERROR_CODE
 
-    async def _start_server_audio_sink_capture(self, active):
+    async def _start_server_audio_sink_capture(self, active, config=None):
         if active.server_audio_sink_handle is not None:
             return
         if not active.capture_session_id:
@@ -559,6 +579,9 @@ class OrbitWhatsAppService:
             active.state.live_stt_available = False
             return
         active.server_audio_sink_handle = handle
+        if config is not None:
+            setattr(config, "audio_capture_strategy", "server_audio_sink")
+            setattr(config, "audio_sink_name", handle.sink_name)
         active.state.live_stt_available = True
         now = now_iso()
         metadata = {
@@ -566,6 +589,9 @@ class OrbitWhatsAppService:
                 "strategy": "server_audio_sink",
                 "sink_name": handle.sink_name,
                 "ffmpeg_pid": self._get_ffmpeg_pid(handle),
+                "routing_mode": active.state.audio_capture_routing_mode,
+                "browser_audio_routed": active.state.browser_audio_routed,
+                "browser_process_isolated": active.state.browser_process_isolated,
                 "started_at": now,
                 "stopped_at": None,
                 "error": None,
@@ -1024,7 +1050,7 @@ class OrbitWhatsAppService:
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
         return f"{meeting_code}-{timestamp}"
 
-    def build_session_config(self, meet_url, session_id):
+    def build_session_config(self, meet_url, session_id, capture_session_id=None):
         default_config = build_default_session_config(meet_url, session_id=session_id)
         return MeetingSessionConfig(
             session_id=session_id,
@@ -1033,7 +1059,10 @@ class OrbitWhatsAppService:
             wait_after_join_ms=default_config.wait_after_join_ms,
             max_steps=default_config.max_steps,
             model_name=default_config.model_name,
+            capture_session_id=capture_session_id,
+            audio_capture_strategy=default_config.audio_capture_strategy,
             live_stt_enabled=default_config.live_stt_enabled,
+            audio_sink_name=default_config.audio_sink_name,
             audio_stream_ws_url=default_config.audio_stream_ws_url,
             audio_stream_token=default_config.audio_stream_token,
         )

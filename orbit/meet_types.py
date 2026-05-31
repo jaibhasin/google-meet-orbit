@@ -30,6 +30,7 @@ class MeetingState:
     meet_url: str
     meeting_code: str
     display_name: str
+    capture_session_id: str | None = None
     status: str = "created"
     status_detail: str | None = None
     joined_at: str | None = None
@@ -46,6 +47,10 @@ class MeetingState:
     live_stt_audio_token: str | None = None
     audio_capture_strategy: str | None = None
     live_stt_status_detail: str | None = None
+    audio_capture_routing_mode: str | None = None
+    browser_audio_routed: bool = False
+    browser_process_isolated: bool = False
+    audio_sink_name: str | None = None
     live_transcript_segments: list[TranscriptSegment] = field(default_factory=list)
     observed_other_participants: bool = False
     solo_participant_polls: int = 0
@@ -68,7 +73,10 @@ class MeetingSessionConfig:
     wait_after_join_ms: int
     max_steps: int
     model_name: str
+    capture_session_id: str | None = None
     live_stt_enabled: bool = False
+    audio_capture_strategy: str | None = None
+    audio_sink_name: str | None = None
     audio_stream_ws_url: str | None = None
     audio_stream_token: str | None = None
 
@@ -88,5 +96,6 @@ def build_meeting_state(config):
         meet_url=config.meet_url,
         meeting_code=extract_meeting_code(config.meet_url),
         display_name=config.display_name,
+        capture_session_id=config.capture_session_id,
         live_stt_audio_token=config.audio_stream_token,
     )

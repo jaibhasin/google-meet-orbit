@@ -929,7 +929,8 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
                 types.SimpleNamespace(live_stt_enabled=True),
             )
 
-        start_capture.assert_awaited_once_with("session-a", "capture-a")
+        start_capture.assert_awaited_once()
+        self.assertEqual(start_capture.await_args.args, ("session-a", "capture-a"))
         self.assertIsNone(active.server_audio_sink_handle)
         self.assertEqual(fake_handle.stop_calls, 1)
         self.assertEqual(
@@ -944,7 +945,69 @@ class WhatsAppMemoryTests(unittest.IsolatedAsyncioTestCase):
             store.capture_session_metadata["audio_capture"]["ffmpeg_pid"],
             4001,
         )
+        self.assertEqual(
+            store.capture_session_metadata["audio_capture"]["routing_mode"],
+            "not_implemented",
+        )
+        self.assertFalse(store.capture_session_metadata["audio_capture"]["browser_audio_routed"])
         self.assertIn("stopped_at", store.capture_session_metadata["audio_capture"])
+
+    async def test_run_session_passes_server_sink_name_to_meeting_launch(self):
+        store = FakeMeetingStore()
+        service = build_service(meeting_store=store)
+        state = MeetingState(
+            session_id="session-aa",
+            meet_url="https://meet.google.com/abc-defg-hij",
+            meeting_code="abc-defg-hij",
+            display_name="Orbit",
+        )
+        active = ActiveMeeting(
+            session_id=state.session_id,
+            meet_url=state.meet_url,
+            state=state,
+            capture_session_id="capture-aa",
+        )
+        service.active_sessions[state.session_id] = active
+
+        captured = {}
+        fake_handle = FakeServerAudioSinkHandle(
+            session_id="session-aa",
+            capture_session_id="capture-aa",
+            sink_name="orbit_meet_session_aa",
+            pid=4021,
+        )
+
+        async def fake_run_meeting_session(config, callbacks=None, state=None):
+            captured["config"] = config
+
+        with patch(
+            "orbit.whatsapp_service.get_audio_capture_strategy",
+            return_value="server_audio_sink",
+        ), patch(
+            "orbit.whatsapp_service.start_server_audio_sink_capture",
+            new_callable=AsyncMock,
+            return_value=fake_handle,
+        ) as start_capture, patch(
+            "orbit.whatsapp_service.run_meeting_session",
+            new=fake_run_meeting_session,
+        ):
+            await service._run_session(
+                active,
+                types.SimpleNamespace(live_stt_enabled=True),
+            )
+
+        start_capture.assert_awaited_once()
+        self.assertEqual(start_capture.await_args.args, ("session-aa", "capture-aa"))
+        self.assertIsNotNone(captured.get("config"))
+        self.assertEqual(
+            captured["config"].audio_sink_name,
+            "orbit_meet_session_aa",
+        )
+        self.assertEqual(captured["config"].audio_capture_strategy, "server_audio_sink")
+        self.assertEqual(
+            store.capture_session_metadata["audio_capture"]["routing_mode"],
+            "not_implemented",
+        )
 
     async def test_run_session_keeps_chrome_extension_behavior_by_default(self):
         store = FakeMeetingStore()
